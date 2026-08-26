@@ -146,5 +146,14 @@ generated/     disposable build output (ignored)
 See [METHODOLOGY.md](METHODOLOGY.md) for design, reproducibility and validation
 details.
 
+## Related work
+
+[CustomDLCoder](https://doi.org/10.1145/3650212.3652119) demonstrated compiling
+TFLite models into specialized C++ programs by extracting and configuring
+TFLite backend computing units. NN2Prog instead focuses on exact,
+dependency-light code generation for microcontrollers and provides a foundation
+for future synthesis of cheaper representations from weights and statically
+derived activation ranges.
+
 The compiler and examples are Apache-2.0 licensed. Bundled model provenance and
 upstream license copies are kept in `models/`.

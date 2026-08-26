@@ -1,0 +1,9 @@
+/build/
+/generated/
+/.pio/
+/examples/esp32-kws/.pio/
+__pycache__/
+*.pyc
+sdkconfig
+sdkconfig.old
+/examples/esp32-kws/sdkconfig.esp32

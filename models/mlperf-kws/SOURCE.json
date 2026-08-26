@@ -1,0 +1,7 @@
+{
+  "project": "MLCommons Tiny",
+  "repository": "https://github.com/mlcommons/tiny",
+  "revision": "4addd0fa08d216e20637637874e084895f289da4",
+  "path": "benchmark/training/keyword_spotting/trained_models/kws_ref_model.tflite",
+  "sha256": "aeea436800704fce17b17292e4412630ad856e9d777c044c64ef748a880bd0ae"
+}

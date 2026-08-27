@@ -19,7 +19,7 @@ TENSOR_TYPES = {
 OPERATORS = {
     0: "ADD", 1: "AVERAGE_POOL_2D", 2: "CONCATENATION", 3: "CONV_2D", 4: "DEPTHWISE_CONV_2D",
     6: "DEQUANTIZE",
-    9: "FULLY_CONNECTED", 14: "LOGISTIC", 18: "MUL", 22: "RESHAPE",
+    9: "FULLY_CONNECTED", 14: "LOGISTIC", 18: "MUL", 22: "RESHAPE", 34: "PAD", 40: "MEAN",
     25: "SOFTMAX", 45: "STRIDED_SLICE", 102: "SPLIT_V", 114: "QUANTIZE", 129: "CALL_ONCE",
     142: "VAR_HANDLE", 143: "READ_VARIABLE", 144: "ASSIGN_VARIABLE",
 }
@@ -27,7 +27,7 @@ OPERATORS = {
 OPTION_TYPES = {
     0: "NONE", 1: "Conv2DOptions", 2: "DepthwiseConv2DOptions",
     5: "Pool2DOptions", 8: "FullyConnectedOptions", 9: "SoftmaxOptions",
-    10: "ConcatenationOptions", 17: "ReshapeOptions",
+    10: "ConcatenationOptions", 17: "ReshapeOptions", 22: "PadOptions", 27: "ReducerOptions",
     11: "AddOptions", 21: "MulOptions", 32: "StridedSliceOptions",
     79: "SplitVOptions",
     103: "CallOnceOptions", 111: "VarHandleOptions",
@@ -153,6 +153,8 @@ def operator_options(reader, opcode, table):
         return {"activation": activation(0)}
     if opcode == "RESHAPE":
         return {"new_shape": reader.scalar_vector(table, 0, "i")}
+    if opcode == "MEAN":
+        return {"keep_dims": bool(reader.scalar(table, 0, "B"))}
     if opcode == "SOFTMAX":
         return {"beta": reader.scalar(table, 0, "f", 1.0)}
     if opcode == "CALL_ONCE":

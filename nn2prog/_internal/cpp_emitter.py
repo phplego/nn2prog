@@ -32,7 +32,10 @@ def emit_cpp(context):
     input_tensor = graph["inputs"][0]
     output_tensor = graph["outputs"][0]
     input_elements = elements(tensors[input_tensor])
+    output_elements = elements(tensors[output_tensor])
     class_name = "Model"
+    return_type = ("std::uint8_t" if argmax_output or output_elements == 1
+                   else f"std::array<std::int8_t,{output_elements}>")
 
     handles = {}
     for op in ops:
@@ -58,8 +61,8 @@ class CLASS_NAME {
  public:
   CLASS_NAME() { reset(); }
   void reset();
-  std::uint8_t invoke(const std::array<std::int8_t,INPUT_ELEMENTS>& input);
-""".replace("CLASS_NAME", class_name).replace("INPUT_ELEMENTS", str(input_elements)))
+  RETURN_TYPE invoke(const std::array<std::int8_t,INPUT_ELEMENTS>& input);
+""".replace("CLASS_NAME", class_name).replace("INPUT_ELEMENTS", str(input_elements)).replace("RETURN_TYPE", return_type))
         h.write("  static std::size_t scratch_bytes();\n")
         h.write(""" private:
 """)
@@ -349,6 +352,52 @@ template<typename T,std::size_t N> class ArrayView {
  private: T* data_;
 };
 """)
+        if any(op["opcode"] == "PAD" for op in ops):
+            c.write("""
+template<std::size_t Rank,std::size_t N,std::size_t O,typename Input>
+void pad_tensor(const Input& in,std::array<std::int8_t,O>& out,
+                const std::array<std::size_t,Rank>& input_shape,
+                const std::array<std::size_t,Rank>& output_shape,
+                const std::array<std::size_t,Rank>& before,std::int8_t zero) {
+  out.fill(zero);
+  for(std::size_t source=0;source<N;++source){
+    std::size_t remainder=source,destination=0,stride=1;
+    for(std::size_t reverse=0;reverse<Rank;++reverse){
+      const std::size_t dimension=Rank-1-reverse;
+      const std::size_t coordinate=remainder%input_shape[dimension];
+      remainder/=input_shape[dimension];
+      destination+=(coordinate+before[dimension])*stride;
+      stride*=output_shape[dimension];
+    }
+    out[destination]=in[source];
+  }
+}
+""")
+        if any(op["opcode"] == "MEAN" for op in ops):
+            c.write("""
+template<std::size_t Rank,std::size_t N,std::size_t O,typename Input>
+void mean_tensor(const Input& in,std::array<std::int8_t,O>& out,
+                 const std::array<std::size_t,Rank>& input_shape,
+                 const std::array<bool,Rank>& reduced,std::size_t count,
+                 int input_zero,int output_zero,std::int32_t multiplier,int shift) {
+  std::array<std::int32_t,O> sums{};
+  for(std::size_t source=0;source<N;++source){
+    std::size_t remainder=source,destination=0,stride=1;
+    for(std::size_t reverse=0;reverse<Rank;++reverse){
+      const std::size_t dimension=Rank-1-reverse;
+      const std::size_t coordinate=remainder%input_shape[dimension];
+      remainder/=input_shape[dimension];
+      if(!reduced[dimension]){destination+=coordinate*stride;stride*=input_shape[dimension];}
+    }
+    sums[destination]+=in[source];
+  }
+  for(std::size_t i=0;i<O;++i){
+    const std::int32_t centered=sums[i]-input_zero*static_cast<std::int32_t>(count);
+    const std::int32_t value=requantize(centered,multiplier,shift)+output_zero;
+    out[i]=static_cast<std::int8_t>(std::clamp<std::int32_t>(value,-128,127));
+  }
+}
+""")
         for line in globals_: c.write(line+"\n")
         c.write("}\n\n")
         c.write(f"void {class_name}::reset(){{\n")
@@ -356,7 +405,7 @@ template<typename T,std::size_t N> class ArrayView {
             c.write(f"  {state_field[name]}.fill(static_cast<std::int8_t>({state_zero_points[name]}));\n")
         c.write("}\n")
         c.write(f"\nstd::size_t {class_name}::scratch_bytes(){{return {program.scratch_bytes};}}\n")
-        c.write(f"\nNN2PROG_ESP32_IRAM std::uint8_t {class_name}::invoke(const std::array<std::int8_t,{input_elements}>& input){{\n")
+        c.write(f"\nNN2PROG_ESP32_IRAM {return_type} {class_name}::invoke(const std::array<std::int8_t,{input_elements}>& input){{\n")
         c.write(f"  alignas(8) std::array<std::uint8_t,{program.scratch_bytes}> scratch_arena;\n")
         for op in ops:
             code=op["opcode"]; ins=op["inputs"]; outs=op["outputs"]
@@ -385,6 +434,21 @@ template<typename T,std::size_t N> class ArrayView {
                             f"std::copy_n({ptr(ins[0])}.data()+outer*{split['axis_size'] * split['inner']}+{offset * split['inner']},"
                             f"{chunk},t{output}.data()+outer*{chunk});\n")
                     offset += size
+            elif code == "PAD":
+                inp=ins[0];o=outs[0];shape=tensors[inp]["shape"];oshape=tensors[o]["shape"]
+                rank=len(shape);before=op["pad"]["before"];zero=tensors[inp]["quantization"]["zero_point"][0]
+                c.write(f"  pad_tensor<{rank},{elements(tensors[inp])},{elements(tensors[o])}>({ptr(inp)},t{o},"
+                        f"std::array<std::size_t,{rank}>{{{','.join(map(str,shape))}}},"
+                        f"std::array<std::size_t,{rank}>{{{','.join(map(str,oshape))}}},"
+                        f"std::array<std::size_t,{rank}>{{{','.join(map(str,before))}}},static_cast<std::int8_t>({zero}));\n")
+            elif code == "MEAN":
+                inp=ins[0];o=outs[0];shape=tensors[inp]["shape"];rank=len(shape);mean=op["mean"]
+                reduced=["true" if index in mean["axes"] else "false" for index in range(rank)]
+                iq=tensors[inp]["quantization"];oq=tensors[o]["quantization"]
+                c.write(f"  mean_tensor<{rank},{elements(tensors[inp])},{elements(tensors[o])}>({ptr(inp)},t{o},"
+                        f"std::array<std::size_t,{rank}>{{{','.join(map(str,shape))}}},"
+                        f"std::array<bool,{rank}>{{{','.join(reduced)}}},{mean['count']},"
+                        f"{iq['zero_point'][0]},{oq['zero_point'][0]},{mean['multiplier']},{mean['shift']});\n")
             elif code == "CONCATENATION":
                 offset=0
                 for x in ins:
@@ -456,6 +520,9 @@ template<typename T,std::size_t N> class ArrayView {
             count=elements(tensors[decision_tensor])
             c.write(f"  std::uint8_t decision=0;for(std::size_t i=1;i<{count};++i)if(t{decision_tensor}[i]>t{decision_tensor}[decision])decision=static_cast<std::uint8_t>(i);\n")
             c.write("  return decision;\n}\n}\n")
-        else:
+        elif output_elements == 1:
             c.write(f"  return t{output_tensor}[0];\n}}\n}}\n")
+        else:
+            c.write(f"  std::array<std::int8_t,{output_elements}> result{{}};"
+                    f"std::copy_n({ptr(output_tensor)}.begin(),{output_elements},result.begin());return result;\n}}\n}}\n")
     print(f"generated {header} and {source}")

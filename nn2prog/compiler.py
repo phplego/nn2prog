@@ -90,10 +90,9 @@ def main():
     input_tensor = graph["inputs"][0]
     output_tensor = graph["outputs"][0]
     output_producer = next((op for op in ops if output_tensor in op["outputs"]), None)
-    argmax_output = elements(tensors[output_tensor]) > 1
+    argmax_output = (elements(tensors[output_tensor]) > 1 and output_producer is not None
+                     and output_producer["opcode"] == "SOFTMAX")
     if argmax_output:
-        if output_producer is None or output_producer["opcode"] != "SOFTMAX":
-            raise ValueError("multi-value output requires SOFTMAX for the generated decision API")
         decision_tensor = output_producer["inputs"][0]
     else:
         decision_tensor = None
@@ -243,6 +242,51 @@ def main():
             outer = math.prod(shape[:axis]); inner = math.prod(shape[axis + 1:])
             op["split_v"] = {"axis_size": shape[axis], "sizes": split_sizes,
                              "outer": outer, "inner": inner}
+        elif op["opcode"] == "PAD":
+            value, paddings_tensor = op["inputs"][:2]
+            output = op["outputs"][0]
+            shape = tensors[value]["shape"]
+            paddings = constant_i32(const, paddings_tensor)
+            if len(paddings) != 2 * len(shape) or any(amount < 0 for amount in paddings):
+                raise ValueError(f"invalid PAD constants at op {op['index']}")
+            before = paddings[::2]
+            after = paddings[1::2]
+            expected = [size + left + right for size, left, right in zip(shape, before, after)]
+            if (tensors[output]["shape"] != expected
+                    or tensors[output]["type"] != tensors[value]["type"]
+                    or tensors[output]["quantization"] != tensors[value]["quantization"]):
+                raise ValueError(f"PAD output contract mismatch at op {op['index']}")
+            if tensors[value]["type"] != "INT8":
+                raise ValueError(f"PAD op {op['index']} currently requires INT8")
+            op["pad"] = {"before": before}
+        elif op["opcode"] == "MEAN":
+            value, axes_tensor = op["inputs"][:2]
+            output = op["outputs"][0]
+            input_shape = tensors[value]["shape"]
+            axes = constant_i32(const, axes_tensor)
+            normalized = []
+            for axis in axes:
+                axis += len(input_shape) if axis < 0 else 0
+                if axis < 0 or axis >= len(input_shape):
+                    raise ValueError(f"invalid MEAN axis at op {op['index']}")
+                if axis not in normalized:
+                    normalized.append(axis)
+            keep_dims = op["options"].get("keep_dims", False)
+            expected = [1 if index in normalized else size for index, size in enumerate(input_shape)]
+            if not keep_dims:
+                expected = [size for index, size in enumerate(input_shape) if index not in normalized]
+            if tensors[output]["shape"] != expected:
+                raise ValueError(f"MEAN output shape mismatch at op {op['index']}")
+            if tensors[value]["type"] != "INT8" or tensors[output]["type"] != "INT8":
+                raise ValueError(f"MEAN op {op['index']} currently requires INT8")
+            iq, oq = tensors[value]["quantization"], tensors[output]["quantization"]
+            multiplier, shift = quantize_multiplier(iq["scale"][0] / oq["scale"][0])
+            count = math.prod(input_shape[axis] for axis in normalized)
+            adjustment = min(count.bit_length() - 1, 32, 31 + shift)
+            multiplier = (multiplier << adjustment) // count
+            shift -= adjustment
+            op["mean"] = {"axes": normalized, "count": count,
+                          "multiplier": multiplier, "shift": shift}
 
     # A quantized logistic input has only 256 possible values, so a lookup table is exact.
     logistic = next((op for op in ops if op["opcode"] == "LOGISTIC"), None)

@@ -77,7 +77,7 @@ class Engine {
  public:
   bool initialize() { return true; }
   std::uint8_t invoke(const nn2prog::mlperf_kws::Frame& frame) { return model_.invoke(frame); }
-  static std::size_t working_bytes() { return nn2prog::generated::Model::scratch_bytes(); }
+  static std::size_t working_bytes() { return nn2prog::generated::Model::working_memory_bytes(); }
   static constexpr const char* name() { return "nn2prog"; }
 
  private:

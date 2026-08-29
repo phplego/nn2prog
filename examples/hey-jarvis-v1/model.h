@@ -8,7 +8,7 @@ class Model {
   Model() { reset(); }
   void reset();
   std::uint8_t invoke(const std::array<std::int8_t,40>& input);
-  static std::size_t scratch_bytes();
+  static std::size_t working_memory_bytes();
  private:
   std::array<std::int8_t,200> state_stream_11_states{};
   std::array<std::int8_t,48> state_stream_12_states{};

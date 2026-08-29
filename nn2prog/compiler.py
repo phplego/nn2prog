@@ -312,7 +312,6 @@ def main():
             "target": target,
             "selection": "static-ir-shapes-quantization-and-int32-range-proof",
             "program": {
-                "scratch_initialization": "producer-defined-no-zero-fill",
                 "esp32_code_placement": "iram1",
             },
             "operators": target_kernels,

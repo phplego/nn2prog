@@ -46,7 +46,7 @@ model and are not maintained as a second source of model parameters.
 
 The current compiler applies:
 
-- reusable scratch-arena allocation from tensor lifetimes;
+- typed buffer reuse derived from tensor lifetimes;
 - zero-copy views where graph semantics permit aliasing;
 - exact integer kernels selected for the requested target;
 - removal of softmax when the public result is only the top-1 class.
@@ -72,8 +72,8 @@ input and unbounded streaming history.
 
 ## Measured ESP32 result
 
-On an ESP32-D0WD-V3 at 240 MHz, MLPerf Tiny KWS measured 33,671,468 median cycles
-(140.30 ms) per invocation, compared with 38,813,809 cycles for TFLite Micro
-with ESP-NN. The generated firmware used 185,915 bytes of flash, 12,536 bytes of
-static RAM and a 16,000-byte reusable working arena. Measurements depend on the
+On an ESP32-D0WD-V3 at 240 MHz, MLPerf Tiny KWS measured 32,487,698 median cycles
+(135.37 ms) per invocation, compared with 38,813,809 cycles for TFLite Micro
+with ESP-NN. The generated firmware used 187,799 bytes of flash, 12,536 bytes of
+static RAM and 16,064 bytes of working memory. Measurements depend on the
 board and toolchain and can be reproduced with the bundled PlatformIO example.

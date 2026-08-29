@@ -4,7 +4,6 @@
 #include <array>
 #include <cstdint>
 #include <limits>
-#include <new>
 #include <type_traits>
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -53,18 +52,18 @@ __attribute__((target("avx2"))) std::int32_t dot_16_zero_minus_128(const std::in
   return _mm_cvtsi128_si32(sums);
 }
 #endif
-template<std::size_t N,std::size_t W,std::size_t B,std::size_t O>
-void dense(const std::array<std::int8_t,N>& in,const std::array<std::uint8_t,W>& weights,const std::array<std::uint8_t,B>& bias,
-           std::array<std::int8_t,O>& out,int input_zero,int output_zero,const std::array<std::int32_t,O>& mult,const std::array<int,O>& shift,int amin,int amax) {
-  static_assert(W==N*O && B==O*4);
+template<std::size_t W,std::size_t B,std::size_t O,typename Input,typename Output>
+void dense(const Input& in,const std::array<std::uint8_t,W>& weights,const std::array<std::uint8_t,B>& bias,
+           Output& out,int input_zero,int output_zero,const std::array<std::int32_t,O>& mult,const std::array<int,O>& shift,int amin,int amax) {
+  static_assert(W%O==0 && B==O*4);constexpr std::size_t N=W/O;
   for(std::size_t oc=0;oc<O;++oc){ std::int32_t acc=load_i32(bias.data()+oc*4);
     for(std::size_t i=0;i<N;++i) acc += static_cast<std::int32_t>(signed_byte(weights[oc*N+i]))*(static_cast<int>(in[i])-input_zero);
     acc=requantize(acc,mult[oc],shift[oc])+output_zero; out[oc]=static_cast<std::int8_t>(std::clamp<std::int32_t>(acc,amin,amax)); }
 }
 template<std::size_t IH,std::size_t IW,std::size_t IC,std::size_t FH,std::size_t FW,std::size_t OC,
-         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B>
+         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B,typename Output>
 void conv2d_nhwc(const Input& in,const std::array<std::uint8_t,W>& weights,const std::array<std::uint8_t,B>& bias,
-           std::array<std::int8_t,OH*OW*OC>& out,int stride_h,int stride_w,int dilation_h,int dilation_w,
+           Output& out,int stride_h,int stride_w,int dilation_h,int dilation_w,
            int pad_h,int pad_w,int input_zero,int weight_zero,int output_zero,
            const std::array<std::int32_t,OC>& mult,const std::array<int,OC>& shift,int amin,int amax) {
   static_assert(W==OC*FH*FW*IC && B==OC*4);
@@ -85,9 +84,9 @@ void conv2d_nhwc(const Input& in,const std::array<std::uint8_t,W>& weights,const
   }
 }
 template<std::size_t IH,std::size_t IW,std::size_t IC,std::size_t OC,std::size_t OH,std::size_t OW,
-         typename Input,std::size_t W>
+         typename Input,std::size_t W,typename Output>
 NN2PROG_ESP32_IRAM void esp32_conv_1x1(const Input& in,const std::array<std::uint8_t,W>& weights,
-           const std::array<std::int32_t,OC>& adjusted_bias,std::array<std::int8_t,OH*OW*OC>& out,
+           const std::array<std::int32_t,OC>& adjusted_bias,Output& out,
            int stride_h,int stride_w,int output_zero,const std::array<std::int32_t,OC>& mult,
            const std::array<int,OC>& shift,int amin,int amax) {
   static_assert(W==OC*IC);
@@ -115,9 +114,9 @@ NN2PROG_ESP32_IRAM void esp32_conv_1x1(const Input& in,const std::array<std::uin
   }
 }
 template<std::size_t IH,std::size_t IW,std::size_t IC,std::size_t FH,std::size_t FW,std::size_t OC,
-         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B>
+         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B,typename Output>
 NN2PROG_ESP32_IRAM void esp32_conv_nhwc(const Input& in,const std::array<std::uint8_t,W>& weights,
-           const std::array<std::uint8_t,B>& bias,std::array<std::int8_t,OH*OW*OC>& out,
+           const std::array<std::uint8_t,B>& bias,Output& out,
            int stride_h,int stride_w,int pad_h,int pad_w,int input_zero,int output_zero,
            const std::array<std::int32_t,OC>& mult,const std::array<int,OC>& shift,int amin,int amax) {
   static_assert(W==OC*FH*FW*IC && B==OC*4);
@@ -151,9 +150,9 @@ NN2PROG_ESP32_IRAM void esp32_conv_nhwc(const Input& in,const std::array<std::ui
   }
 }
 template<std::size_t IH,std::size_t IW,std::size_t IC,std::size_t FH,std::size_t FW,std::size_t DM,
-         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B>
+         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B,typename Output>
 void depthwise_nhwc(const Input& in,const std::array<std::uint8_t,W>& weights,const std::array<std::uint8_t,B>& bias,
-           std::array<std::int8_t,OH*OW*IC*DM>& out,int stride_h,int stride_w,int dilation_h,int dilation_w,
+           Output& out,int stride_h,int stride_w,int dilation_h,int dilation_w,
            int pad_h,int pad_w,int input_zero,int weight_zero,int output_zero,
            const std::array<std::int32_t,IC*DM>& mult,const std::array<int,IC*DM>& shift,int amin,int amax) {
   constexpr std::size_t OC=IC*DM; static_assert(W==FH*FW*OC && B==OC*4);
@@ -172,9 +171,9 @@ void depthwise_nhwc(const Input& in,const std::array<std::uint8_t,W>& weights,co
   }
 }
 template<std::size_t IH,std::size_t IW,std::size_t C,std::size_t FH,std::size_t FW,
-         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B>
+         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B,typename Output>
 NN2PROG_ESP32_IRAM void esp32_depthwise_channels4(const Input& in,const std::array<std::uint8_t,W>& weights,
-           const std::array<std::uint8_t,B>& bias,std::array<std::int8_t,OH*OW*C>& out,
+           const std::array<std::uint8_t,B>& bias,Output& out,
            int stride_h,int stride_w,int pad_h,int pad_w,int input_zero,int output_zero,
            const std::array<std::int32_t,C>& mult,const std::array<int,C>& shift,int amin,int amax) {
   static_assert(W==FH*FW*C && B==C*4 && C%4==0);
@@ -206,8 +205,8 @@ NN2PROG_ESP32_IRAM void esp32_depthwise_channels4(const Input& in,const std::arr
     }
   }
 }
-template<std::size_t IH,std::size_t IW,std::size_t C,std::size_t OH,std::size_t OW,typename Input>
-void average_pool_nhwc(const Input& in,std::array<std::int8_t,OH*OW*C>& out,int filter_h,int filter_w,
+template<std::size_t IH,std::size_t IW,std::size_t C,std::size_t OH,std::size_t OW,typename Input,typename Output>
+void average_pool_nhwc(const Input& in,Output& out,int filter_h,int filter_w,
            int stride_h,int stride_w,int pad_h,int pad_w,int amin,int amax) {
   for(std::size_t oy=0;oy<OH;++oy)for(std::size_t ox=0;ox<OW;++ox)for(std::size_t c=0;c<C;++c){
     std::int32_t sum=0;int count=0;
@@ -220,9 +219,9 @@ void average_pool_nhwc(const Input& in,std::array<std::int8_t,OH*OW*C>& out,int 
     out[(oy*OW+ox)*C+c]=static_cast<std::int8_t>(std::clamp(rounded,amin,amax));
   }
 }
-template<typename Input,std::size_t W,std::size_t B,std::size_t O>
+template<typename Input,std::size_t W,std::size_t B,std::size_t O,typename Output>
 void depthwise_single_output(const Input& in,const std::array<std::uint8_t,W>& weights,
-           const std::array<std::uint8_t,B>& bias,std::array<std::int8_t,O>& out,int input_zero,int output_zero,
+           const std::array<std::uint8_t,B>& bias,Output& out,int input_zero,int output_zero,
            const std::array<std::int32_t,O>& mult,const std::array<int,O>& shift,int amin,int amax) {
   static_assert(B==O*4 && W%O==0); constexpr std::size_t Kernel=W/O;
   for(std::size_t channel=0;channel<O;++channel){std::int32_t acc=load_i32(bias.data()+channel*4);
@@ -231,9 +230,9 @@ void depthwise_single_output(const Input& in,const std::array<std::uint8_t,W>& w
     acc=requantize(acc,mult[channel],shift[channel])+output_zero;
     out[channel]=static_cast<std::int8_t>(std::clamp<std::int32_t>(acc,amin,amax));}
 }
-template<std::size_t Block,typename Input,std::size_t W,std::size_t B,std::size_t O>
+template<std::size_t Block,typename Input,std::size_t W,std::size_t B,std::size_t O,typename Output>
 void dense_masked_simd_blocks(const Input& in,const std::array<std::uint8_t,W>& weights,const std::array<std::uint8_t,B>& bias,
-           std::array<std::int8_t,O>& out,int input_zero,int output_zero,const std::array<std::int32_t,O>& mult,
+           Output& out,int input_zero,int output_zero,const std::array<std::int32_t,O>& mult,
            const std::array<int,O>& shift,int amin,int amax) {
   constexpr std::size_t N=W/O, Blocks=(N+Block-1)/Block;static_assert(W==N*O && B==O*4);
   using BlockIndex=std::conditional_t<(Blocks<=256),std::uint8_t,std::uint16_t>;
@@ -259,6 +258,7 @@ template<typename T,std::size_t N> class ArrayView {
   explicit ArrayView(T* data):data_(data){}
   T* begin() const{return data_;} T* end() const{return data_+N;} T* data() const{return data_;}
   constexpr std::size_t size() const{return N;} T& operator[](std::size_t i) const{return data_[i];}
+  void fill(std::remove_const_t<T> value) const{std::fill(begin(),end(),value);}
  private: T* data_;
 };
 constexpr std::array<std::int32_t,32> op17_mult = {1818415719,1483719127,2027094634,1212786360,1718181835,1890243475,1666664234,1127797955,1190529712,1544064846,1714947475,1287927853,1806339417,1692158998,1555047281,1131611751,1296262503,1221966222,1465325713,1414902161,1445545554,1953942482,1767046067,1750196408,1653078050,1560561113,1555588356,1713946075,1320497782,1613644991,1568973858,1544728783};
@@ -324,224 +324,313 @@ void Model::reset(){
   state_stream_21_states.fill(static_cast<std::int8_t>(-128));
 }
 
-std::size_t Model::scratch_bytes(){return 7200;}
+std::size_t Model::working_memory_bytes(){return 7473;}
 
 NN2PROG_ESP32_IRAM std::uint8_t Model::invoke(const std::array<std::int8_t,40>& input){
-  alignas(8) std::array<std::uint8_t,7200> scratch_arena;
+  std::array<std::int8_t,7104> buffer_0;
+  std::array<std::int8_t,120> buffer_1;
+  std::array<std::int8_t,120> buffer_2;
+  std::array<std::int8_t,96> buffer_3;
+  std::array<std::uint8_t,1> buffer_4;
   // op 12: RESHAPE
-  const auto& t71=input;
+  const auto& tensor_71=input;
   // op 13: READ_VARIABLE
-  const auto& t72=state_stream_11_states;
+  const auto& tensor_72=state_stream_11_states;
   // op 14: STRIDED_SLICE
-  ArrayView<const std::int8_t,160> t73(t72.data()+40);
-  auto& t74=*::new (static_cast<void*>(scratch_arena.data()+0)) std::array<std::int8_t,200>;
-  // op 15: CONCATENATION
-  std::copy_n(t73.begin(),160,t74.begin()+0);
-  std::copy_n(t71.begin(),40,t74.begin()+160);
+  ArrayView<const std::int8_t,160> tensor_73(tensor_72.data()+40);
+  {
+    ArrayView<std::int8_t,200> tensor_74(buffer_0.data());
+    // op 15: CONCATENATION
+    std::copy_n(tensor_73.begin(),160,tensor_74.begin()+0);
+    std::copy_n(tensor_71.begin(),40,tensor_74.begin()+160);
+  }
   // op 16: ASSIGN_VARIABLE
-  std::copy_n(t74.begin(),t74.size(),state_stream_11_states.begin());
-  auto& t75=*::new (static_cast<void*>(scratch_arena.data()+200)) std::array<std::int8_t,32>;
-  // op 17: CONV_2D
-  dense(t74,sg0_tensor59_bytes,sg0_tensor58_bytes,t75,-128,21,op17_mult,op17_shift,-128,127);
+  std::copy_n(ArrayView<const std::int8_t,200>(buffer_0.data()).begin(),ArrayView<const std::int8_t,200>(buffer_0.data()).size(),state_stream_11_states.begin());
+  {
+    ArrayView<std::int8_t,32> tensor_75(buffer_1.data());
+    // op 17: CONV_2D
+    dense(ArrayView<const std::int8_t,200>(buffer_0.data()),sg0_tensor59_bytes,sg0_tensor58_bytes,tensor_75,-128,21,op17_mult,op17_shift,-128,127);
+  }
   // op 18: RESHAPE
-  const auto& t76=t75;
+  const auto& tensor_76=ArrayView<const std::int8_t,32>(buffer_1.data());
   // op 19: READ_VARIABLE
-  const auto& t77=state_stream_12_states;
+  const auto& tensor_77=state_stream_12_states;
   // op 20: READ_VARIABLE
-  const auto& t78=state_stream_13_states;
+  const auto& tensor_78=state_stream_13_states;
   // op 21: READ_VARIABLE
-  const auto& t79=state_stream_14_states;
+  const auto& tensor_79=state_stream_14_states;
   // op 22: READ_VARIABLE
-  const auto& t80=state_stream_15_states;
+  const auto& tensor_80=state_stream_15_states;
   // op 23: READ_VARIABLE
-  const auto& t81=state_stream_16_states;
+  const auto& tensor_81=state_stream_16_states;
   // op 24: READ_VARIABLE
-  const auto& t82=state_stream_17_states;
+  const auto& tensor_82=state_stream_17_states;
   // op 25: READ_VARIABLE
-  const auto& t83=state_stream_18_states;
+  const auto& tensor_83=state_stream_18_states;
   // op 26: READ_VARIABLE
-  const auto& t84=state_stream_19_states;
+  const auto& tensor_84=state_stream_19_states;
   // op 27: READ_VARIABLE
-  const auto& t85=state_stream_20_states;
+  const auto& tensor_85=state_stream_20_states;
   // op 28: READ_VARIABLE
-  const auto& t86=state_stream_21_states;
+  const auto& tensor_86=state_stream_21_states;
   // op 29: STRIDED_SLICE
-  ArrayView<const std::int8_t,7008> t87(t86.data()+96);
-  auto& t88=*::new (static_cast<void*>(scratch_arena.data()+0)) std::array<std::int8_t,32>;
-  // op 30: MUL
-  for(std::size_t i=0;i<t88.size();++i){int av=static_cast<int>(t76[i])-(21);int bv=static_cast<int>(signed_byte(sg0_tensor57_bytes[i%4]))-(-128);int v=requantize(av*bv,1237366504,-7)+(29);t88[i]=static_cast<std::int8_t>(std::clamp(v,-128,127));}
-  auto& t89=*::new (static_cast<void*>(scratch_arena.data()+32)) std::array<std::int8_t,32>;
-  // op 31: ADD
-  for(std::size_t i=0;i<t89.size();++i){int av=(static_cast<int>(t88[i])-(29))*(1<<20);int bv=(static_cast<int>(signed_byte(sg0_tensor56_bytes[i%4]))-(-128))*(1<<20);int x=requantize(av,1073741824,0)+requantize(bv,1679336654,-6);int v=requantize(x,1402506963,-17)+(-128);t89[i]=static_cast<std::int8_t>(std::clamp(v,-128,127));}
+  ArrayView<const std::int8_t,7008> tensor_87(tensor_86.data()+96);
+  {
+    std::array<std::int8_t,32> tensor_88;
+    // op 30: MUL
+    for(std::size_t i=0;i<tensor_88.size();++i){int av=static_cast<int>(tensor_76[i])-(21);int bv=static_cast<int>(signed_byte(sg0_tensor57_bytes[i%4]))-(-128);int v=requantize(av*bv,1237366504,-7)+(29);tensor_88[i]=static_cast<std::int8_t>(std::clamp(v,-128,127));}
+    std::copy_n(tensor_88.begin(),tensor_88.size(),buffer_1.begin());
+  }
+  {
+    std::array<std::int8_t,32> tensor_89;
+    // op 31: ADD
+    for(std::size_t i=0;i<tensor_89.size();++i){int av=(static_cast<int>(ArrayView<const std::int8_t,32>(buffer_1.data())[i])-(29))*(1<<20);int bv=(static_cast<int>(signed_byte(sg0_tensor56_bytes[i%4]))-(-128))*(1<<20);int x=requantize(av,1073741824,0)+requantize(bv,1679336654,-6);int v=requantize(x,1402506963,-17)+(-128);tensor_89[i]=static_cast<std::int8_t>(std::clamp(v,-128,127));}
+    std::copy_n(tensor_89.begin(),tensor_89.size(),buffer_1.begin());
+  }
   // op 32: RESHAPE
-  const auto& t90=t89;
-  auto& t91=*::new (static_cast<void*>(scratch_arena.data()+0)) std::array<std::int8_t,24>;
-  // op 33: CONV_2D
-  dense(t90,sg0_tensor55_bytes,sg0_tensor54_bytes,t91,-128,-128,op33_mult,op33_shift,-128,127);
-  auto& t92=*::new (static_cast<void*>(scratch_arena.data()+64)) std::array<std::int8_t,24>;
-  // op 34: CONV_2D
-  dense(t90,sg0_tensor53_bytes,sg0_tensor52_bytes,t92,-128,-128,op34_mult,op34_shift,-128,127);
-  auto& t93=*::new (static_cast<void*>(scratch_arena.data()+88)) std::array<std::int8_t,72>;
-  // op 35: CONCATENATION
-  std::copy_n(t77.begin(),48,t93.begin()+0);
-  std::copy_n(t92.begin(),24,t93.begin()+48);
+  const auto& tensor_90=ArrayView<const std::int8_t,32>(buffer_1.data());
+  {
+    ArrayView<std::int8_t,24> tensor_91(buffer_0.data());
+    // op 33: CONV_2D
+    dense(tensor_90,sg0_tensor55_bytes,sg0_tensor54_bytes,tensor_91,-128,-128,op33_mult,op33_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,24> tensor_92(buffer_2.data());
+    // op 34: CONV_2D
+    dense(tensor_90,sg0_tensor53_bytes,sg0_tensor52_bytes,tensor_92,-128,-128,op34_mult,op34_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,72> tensor_93(buffer_3.data());
+    // op 35: CONCATENATION
+    std::copy_n(tensor_77.begin(),48,tensor_93.begin()+0);
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_2.data()).begin(),24,tensor_93.begin()+48);
+  }
   // op 36: STRIDED_SLICE
-  ArrayView<const std::int8_t,48> t94(t93.data()+24);
+  ArrayView<const std::int8_t,48> tensor_94(ArrayView<const std::int8_t,72>(buffer_3.data()).data()+24);
   // op 37: ASSIGN_VARIABLE
-  std::copy_n(t94.begin(),t94.size(),state_stream_12_states.begin());
-  auto& t95=*::new (static_cast<void*>(scratch_arena.data()+64)) std::array<std::int8_t,24>;
-  // op 38: CONV_2D
-  dense(t93,sg0_tensor51_bytes,sg0_tensor50_bytes,t95,-128,-128,op38_mult,op38_shift,-128,127);
-  auto& t96=*::new (static_cast<void*>(scratch_arena.data()+88)) std::array<std::int8_t,24>;
-  // op 39: CONV_2D
-  dense(t90,sg0_tensor49_bytes,sg0_tensor48_bytes,t96,-128,-128,op39_mult,op39_shift,-128,127);
-  auto& t97=*::new (static_cast<void*>(scratch_arena.data()+112)) std::array<std::int8_t,72>;
-  // op 40: CONCATENATION
-  std::copy_n(t78.begin(),48,t97.begin()+0);
-  std::copy_n(t96.begin(),24,t97.begin()+48);
+  std::copy_n(tensor_94.begin(),tensor_94.size(),state_stream_12_states.begin());
+  {
+    ArrayView<std::int8_t,24> tensor_95(buffer_2.data());
+    // op 38: CONV_2D
+    dense(ArrayView<const std::int8_t,72>(buffer_3.data()),sg0_tensor51_bytes,sg0_tensor50_bytes,tensor_95,-128,-128,op38_mult,op38_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,24> tensor_96(buffer_3.data());
+    // op 39: CONV_2D
+    dense(tensor_90,sg0_tensor49_bytes,sg0_tensor48_bytes,tensor_96,-128,-128,op39_mult,op39_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,72> tensor_97(buffer_1.data());
+    // op 40: CONCATENATION
+    std::copy_n(tensor_78.begin(),48,tensor_97.begin()+0);
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_3.data()).begin(),24,tensor_97.begin()+48);
+  }
   // op 41: STRIDED_SLICE
-  ArrayView<const std::int8_t,48> t98(t97.data()+24);
+  ArrayView<const std::int8_t,48> tensor_98(ArrayView<const std::int8_t,72>(buffer_1.data()).data()+24);
   // op 42: ASSIGN_VARIABLE
-  std::copy_n(t98.begin(),t98.size(),state_stream_13_states.begin());
-  auto& t99=*::new (static_cast<void*>(scratch_arena.data()+24)) std::array<std::int8_t,24>;
-  // op 43: CONV_2D
-  dense(t97,sg0_tensor47_bytes,sg0_tensor46_bytes,t99,-128,-128,op43_mult,op43_shift,-128,127);
-  auto& t100=*::new (static_cast<void*>(scratch_arena.data()+88)) std::array<std::int8_t,72>;
-  // op 44: CONCATENATION
-  std::copy_n(t79.begin(),48,t100.begin()+0);
-  std::copy_n(t99.begin(),24,t100.begin()+48);
+  std::copy_n(tensor_98.begin(),tensor_98.size(),state_stream_13_states.begin());
+  {
+    ArrayView<std::int8_t,24> tensor_99(buffer_3.data());
+    // op 43: CONV_2D
+    dense(ArrayView<const std::int8_t,72>(buffer_1.data()),sg0_tensor47_bytes,sg0_tensor46_bytes,tensor_99,-128,-128,op43_mult,op43_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,72> tensor_100(buffer_1.data());
+    // op 44: CONCATENATION
+    std::copy_n(tensor_79.begin(),48,tensor_100.begin()+0);
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_3.data()).begin(),24,tensor_100.begin()+48);
+  }
   // op 45: STRIDED_SLICE
-  ArrayView<const std::int8_t,48> t101(t100.data()+24);
+  ArrayView<const std::int8_t,48> tensor_101(ArrayView<const std::int8_t,72>(buffer_1.data()).data()+24);
   // op 46: ASSIGN_VARIABLE
-  std::copy_n(t101.begin(),t101.size(),state_stream_14_states.begin());
-  auto& t102=*::new (static_cast<void*>(scratch_arena.data()+24)) std::array<std::int8_t,24>;
-  // op 47: CONV_2D
-  dense(t100,sg0_tensor45_bytes,sg0_tensor44_bytes,t102,-128,-128,op47_mult,op47_shift,-128,127);
-  auto& t103=*::new (static_cast<void*>(scratch_arena.data()+88)) std::array<std::int8_t,72>;
-  // op 48: CONCATENATION
-  std::copy_n(t91.begin(),24,t103.begin()+0);
-  std::copy_n(t95.begin(),24,t103.begin()+24);
-  std::copy_n(t102.begin(),24,t103.begin()+48);
-  auto& t104=*::new (static_cast<void*>(scratch_arena.data()+0)) std::array<std::int8_t,32>;
-  // op 49: CONV_2D
-  dense(t103,sg0_tensor43_bytes,sg0_tensor42_bytes,t104,-128,-128,op49_mult,op49_shift,-128,127);
-  auto& t105=*::new (static_cast<void*>(scratch_arena.data()+32)) std::array<std::int8_t,24>;
-  // op 50: CONV_2D
-  dense(t104,sg0_tensor41_bytes,sg0_tensor40_bytes,t105,-128,-128,op50_mult,op50_shift,-128,127);
-  auto& t106=*::new (static_cast<void*>(scratch_arena.data()+56)) std::array<std::int8_t,24>;
-  // op 51: CONV_2D
-  dense(t104,sg0_tensor39_bytes,sg0_tensor38_bytes,t106,-128,-128,op51_mult,op51_shift,-128,127);
-  auto& t107=*::new (static_cast<void*>(scratch_arena.data()+80)) std::array<std::int8_t,120>;
-  // op 52: CONCATENATION
-  std::copy_n(t80.begin(),96,t107.begin()+0);
-  std::copy_n(t106.begin(),24,t107.begin()+96);
+  std::copy_n(tensor_101.begin(),tensor_101.size(),state_stream_14_states.begin());
+  {
+    ArrayView<std::int8_t,24> tensor_102(buffer_3.data());
+    // op 47: CONV_2D
+    dense(ArrayView<const std::int8_t,72>(buffer_1.data()),sg0_tensor45_bytes,sg0_tensor44_bytes,tensor_102,-128,-128,op47_mult,op47_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,72> tensor_103(buffer_1.data());
+    // op 48: CONCATENATION
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_0.data()).begin(),24,tensor_103.begin()+0);
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_2.data()).begin(),24,tensor_103.begin()+24);
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_3.data()).begin(),24,tensor_103.begin()+48);
+  }
+  {
+    ArrayView<std::int8_t,32> tensor_104(buffer_2.data());
+    // op 49: CONV_2D
+    dense(ArrayView<const std::int8_t,72>(buffer_1.data()),sg0_tensor43_bytes,sg0_tensor42_bytes,tensor_104,-128,-128,op49_mult,op49_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,24> tensor_105(buffer_1.data());
+    // op 50: CONV_2D
+    dense(ArrayView<const std::int8_t,32>(buffer_2.data()),sg0_tensor41_bytes,sg0_tensor40_bytes,tensor_105,-128,-128,op50_mult,op50_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,24> tensor_106(buffer_3.data());
+    // op 51: CONV_2D
+    dense(ArrayView<const std::int8_t,32>(buffer_2.data()),sg0_tensor39_bytes,sg0_tensor38_bytes,tensor_106,-128,-128,op51_mult,op51_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,120> tensor_107(buffer_0.data());
+    // op 52: CONCATENATION
+    std::copy_n(tensor_80.begin(),96,tensor_107.begin()+0);
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_3.data()).begin(),24,tensor_107.begin()+96);
+  }
   // op 53: STRIDED_SLICE
-  ArrayView<const std::int8_t,96> t108(t107.data()+24);
+  ArrayView<const std::int8_t,96> tensor_108(ArrayView<const std::int8_t,120>(buffer_0.data()).data()+24);
   // op 54: ASSIGN_VARIABLE
-  std::copy_n(t108.begin(),t108.size(),state_stream_15_states.begin());
-  auto& t109=*::new (static_cast<void*>(scratch_arena.data()+56)) std::array<std::int8_t,24>;
-  // op 55: CONV_2D
-  dense(t107,sg0_tensor37_bytes,sg0_tensor36_bytes,t109,-128,-128,op55_mult,op55_shift,-128,127);
-  auto& t110=*::new (static_cast<void*>(scratch_arena.data()+80)) std::array<std::int8_t,24>;
-  // op 56: CONV_2D
-  dense(t104,sg0_tensor35_bytes,sg0_tensor34_bytes,t110,-128,-128,op56_mult,op56_shift,-128,127);
-  auto& t111=*::new (static_cast<void*>(scratch_arena.data()+104)) std::array<std::int8_t,120>;
-  // op 57: CONCATENATION
-  std::copy_n(t81.begin(),96,t111.begin()+0);
-  std::copy_n(t110.begin(),24,t111.begin()+96);
+  std::copy_n(tensor_108.begin(),tensor_108.size(),state_stream_15_states.begin());
+  {
+    ArrayView<std::int8_t,24> tensor_109(buffer_3.data());
+    // op 55: CONV_2D
+    dense(ArrayView<const std::int8_t,120>(buffer_0.data()),sg0_tensor37_bytes,sg0_tensor36_bytes,tensor_109,-128,-128,op55_mult,op55_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,24> tensor_110(buffer_0.data());
+    // op 56: CONV_2D
+    dense(ArrayView<const std::int8_t,32>(buffer_2.data()),sg0_tensor35_bytes,sg0_tensor34_bytes,tensor_110,-128,-128,op56_mult,op56_shift,-128,127);
+  }
+  {
+    auto& tensor_111=buffer_2;
+    // op 57: CONCATENATION
+    std::copy_n(tensor_81.begin(),96,tensor_111.begin()+0);
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_0.data()).begin(),24,tensor_111.begin()+96);
+  }
   // op 58: STRIDED_SLICE
-  ArrayView<const std::int8_t,96> t112(t111.data()+24);
+  ArrayView<const std::int8_t,96> tensor_112(buffer_2.data()+24);
   // op 59: ASSIGN_VARIABLE
-  std::copy_n(t112.begin(),t112.size(),state_stream_16_states.begin());
-  auto& t113=*::new (static_cast<void*>(scratch_arena.data()+0)) std::array<std::int8_t,24>;
-  // op 60: CONV_2D
-  dense(t111,sg0_tensor33_bytes,sg0_tensor32_bytes,t113,-128,-128,op60_mult,op60_shift,-128,127);
-  auto& t114=*::new (static_cast<void*>(scratch_arena.data()+80)) std::array<std::int8_t,120>;
-  // op 61: CONCATENATION
-  std::copy_n(t82.begin(),96,t114.begin()+0);
-  std::copy_n(t113.begin(),24,t114.begin()+96);
+  std::copy_n(tensor_112.begin(),tensor_112.size(),state_stream_16_states.begin());
+  {
+    ArrayView<std::int8_t,24> tensor_113(buffer_0.data());
+    // op 60: CONV_2D
+    dense(buffer_2,sg0_tensor33_bytes,sg0_tensor32_bytes,tensor_113,-128,-128,op60_mult,op60_shift,-128,127);
+  }
+  {
+    auto& tensor_114=buffer_2;
+    // op 61: CONCATENATION
+    std::copy_n(tensor_82.begin(),96,tensor_114.begin()+0);
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_0.data()).begin(),24,tensor_114.begin()+96);
+  }
   // op 62: STRIDED_SLICE
-  ArrayView<const std::int8_t,96> t115(t114.data()+24);
+  ArrayView<const std::int8_t,96> tensor_115(buffer_2.data()+24);
   // op 63: ASSIGN_VARIABLE
-  std::copy_n(t115.begin(),t115.size(),state_stream_17_states.begin());
-  auto& t116=*::new (static_cast<void*>(scratch_arena.data()+0)) std::array<std::int8_t,24>;
-  // op 64: CONV_2D
-  dense(t114,sg0_tensor31_bytes,sg0_tensor30_bytes,t116,-128,-128,op64_mult,op64_shift,-128,127);
-  auto& t117=*::new (static_cast<void*>(scratch_arena.data()+80)) std::array<std::int8_t,72>;
-  // op 65: CONCATENATION
-  std::copy_n(t105.begin(),24,t117.begin()+0);
-  std::copy_n(t109.begin(),24,t117.begin()+24);
-  std::copy_n(t116.begin(),24,t117.begin()+48);
-  auto& t118=*::new (static_cast<void*>(scratch_arena.data()+0)) std::array<std::int8_t,64>;
-  // op 66: CONV_2D
-  dense(t117,sg0_tensor29_bytes,sg0_tensor28_bytes,t118,-128,-128,op66_mult,op66_shift,-128,127);
-  auto& t119=*::new (static_cast<void*>(scratch_arena.data()+64)) std::array<std::int8_t,24>;
-  // op 67: CONV_2D
-  dense(t118,sg0_tensor27_bytes,sg0_tensor26_bytes,t119,-128,-128,op67_mult,op67_shift,-128,127);
-  auto& t120=*::new (static_cast<void*>(scratch_arena.data()+88)) std::array<std::int8_t,24>;
-  // op 68: CONV_2D
-  dense(t118,sg0_tensor25_bytes,sg0_tensor24_bytes,t120,-128,-128,op68_mult,op68_shift,-128,127);
-  auto& t121=*::new (static_cast<void*>(scratch_arena.data()+112)) std::array<std::int8_t,120>;
-  // op 69: CONCATENATION
-  std::copy_n(t83.begin(),96,t121.begin()+0);
-  std::copy_n(t120.begin(),24,t121.begin()+96);
+  std::copy_n(tensor_115.begin(),tensor_115.size(),state_stream_17_states.begin());
+  {
+    ArrayView<std::int8_t,24> tensor_116(buffer_0.data());
+    // op 64: CONV_2D
+    dense(buffer_2,sg0_tensor31_bytes,sg0_tensor30_bytes,tensor_116,-128,-128,op64_mult,op64_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,72> tensor_117(buffer_2.data());
+    // op 65: CONCATENATION
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_1.data()).begin(),24,tensor_117.begin()+0);
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_3.data()).begin(),24,tensor_117.begin()+24);
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_0.data()).begin(),24,tensor_117.begin()+48);
+  }
+  {
+    ArrayView<std::int8_t,64> tensor_118(buffer_1.data());
+    // op 66: CONV_2D
+    dense(ArrayView<const std::int8_t,72>(buffer_2.data()),sg0_tensor29_bytes,sg0_tensor28_bytes,tensor_118,-128,-128,op66_mult,op66_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,24> tensor_119(buffer_3.data());
+    // op 67: CONV_2D
+    dense(ArrayView<const std::int8_t,64>(buffer_1.data()),sg0_tensor27_bytes,sg0_tensor26_bytes,tensor_119,-128,-128,op67_mult,op67_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,24> tensor_120(buffer_2.data());
+    // op 68: CONV_2D
+    dense(ArrayView<const std::int8_t,64>(buffer_1.data()),sg0_tensor25_bytes,sg0_tensor24_bytes,tensor_120,-128,-128,op68_mult,op68_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,120> tensor_121(buffer_0.data());
+    // op 69: CONCATENATION
+    std::copy_n(tensor_83.begin(),96,tensor_121.begin()+0);
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_2.data()).begin(),24,tensor_121.begin()+96);
+  }
   // op 70: STRIDED_SLICE
-  ArrayView<const std::int8_t,96> t122(t121.data()+24);
+  ArrayView<const std::int8_t,96> tensor_122(ArrayView<const std::int8_t,120>(buffer_0.data()).data()+24);
   // op 71: ASSIGN_VARIABLE
-  std::copy_n(t122.begin(),t122.size(),state_stream_18_states.begin());
-  auto& t123=*::new (static_cast<void*>(scratch_arena.data()+88)) std::array<std::int8_t,24>;
-  // op 72: CONV_2D
-  dense(t121,sg0_tensor23_bytes,sg0_tensor22_bytes,t123,-128,-128,op72_mult,op72_shift,-128,127);
-  auto& t124=*::new (static_cast<void*>(scratch_arena.data()+112)) std::array<std::int8_t,24>;
-  // op 73: CONV_2D
-  dense(t118,sg0_tensor21_bytes,sg0_tensor20_bytes,t124,-128,-128,op73_mult,op73_shift,-128,127);
-  auto& t125=*::new (static_cast<void*>(scratch_arena.data()+136)) std::array<std::int8_t,120>;
-  // op 74: CONCATENATION
-  std::copy_n(t84.begin(),96,t125.begin()+0);
-  std::copy_n(t124.begin(),24,t125.begin()+96);
+  std::copy_n(tensor_122.begin(),tensor_122.size(),state_stream_18_states.begin());
+  {
+    ArrayView<std::int8_t,24> tensor_123(buffer_2.data());
+    // op 72: CONV_2D
+    dense(ArrayView<const std::int8_t,120>(buffer_0.data()),sg0_tensor23_bytes,sg0_tensor22_bytes,tensor_123,-128,-128,op72_mult,op72_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,24> tensor_124(buffer_0.data());
+    // op 73: CONV_2D
+    dense(ArrayView<const std::int8_t,64>(buffer_1.data()),sg0_tensor21_bytes,sg0_tensor20_bytes,tensor_124,-128,-128,op73_mult,op73_shift,-128,127);
+  }
+  {
+    auto& tensor_125=buffer_1;
+    // op 74: CONCATENATION
+    std::copy_n(tensor_84.begin(),96,tensor_125.begin()+0);
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_0.data()).begin(),24,tensor_125.begin()+96);
+  }
   // op 75: STRIDED_SLICE
-  ArrayView<const std::int8_t,96> t126(t125.data()+24);
+  ArrayView<const std::int8_t,96> tensor_126(buffer_1.data()+24);
   // op 76: ASSIGN_VARIABLE
-  std::copy_n(t126.begin(),t126.size(),state_stream_19_states.begin());
-  auto& t127=*::new (static_cast<void*>(scratch_arena.data()+0)) std::array<std::int8_t,24>;
-  // op 77: CONV_2D
-  dense(t125,sg0_tensor19_bytes,sg0_tensor18_bytes,t127,-128,-128,op77_mult,op77_shift,-128,127);
-  auto& t128=*::new (static_cast<void*>(scratch_arena.data()+112)) std::array<std::int8_t,120>;
-  // op 78: CONCATENATION
-  std::copy_n(t85.begin(),96,t128.begin()+0);
-  std::copy_n(t127.begin(),24,t128.begin()+96);
+  std::copy_n(tensor_126.begin(),tensor_126.size(),state_stream_19_states.begin());
+  {
+    ArrayView<std::int8_t,24> tensor_127(buffer_0.data());
+    // op 77: CONV_2D
+    dense(buffer_1,sg0_tensor19_bytes,sg0_tensor18_bytes,tensor_127,-128,-128,op77_mult,op77_shift,-128,127);
+  }
+  {
+    auto& tensor_128=buffer_1;
+    // op 78: CONCATENATION
+    std::copy_n(tensor_85.begin(),96,tensor_128.begin()+0);
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_0.data()).begin(),24,tensor_128.begin()+96);
+  }
   // op 79: STRIDED_SLICE
-  ArrayView<const std::int8_t,96> t129(t128.data()+24);
+  ArrayView<const std::int8_t,96> tensor_129(buffer_1.data()+24);
   // op 80: ASSIGN_VARIABLE
-  std::copy_n(t129.begin(),t129.size(),state_stream_20_states.begin());
-  auto& t130=*::new (static_cast<void*>(scratch_arena.data()+0)) std::array<std::int8_t,24>;
-  // op 81: CONV_2D
-  dense(t128,sg0_tensor17_bytes,sg0_tensor16_bytes,t130,-128,-128,op81_mult,op81_shift,-128,127);
-  auto& t131=*::new (static_cast<void*>(scratch_arena.data()+112)) std::array<std::int8_t,72>;
-  // op 82: CONCATENATION
-  std::copy_n(t119.begin(),24,t131.begin()+0);
-  std::copy_n(t123.begin(),24,t131.begin()+24);
-  std::copy_n(t130.begin(),24,t131.begin()+48);
-  auto& t132=*::new (static_cast<void*>(scratch_arena.data()+0)) std::array<std::int8_t,96>;
-  // op 83: CONV_2D
-  dense(t131,sg0_tensor15_bytes,sg0_tensor14_bytes,t132,-128,-128,op83_mult,op83_shift,-128,127);
-  auto& t133=*::new (static_cast<void*>(scratch_arena.data()+96)) std::array<std::int8_t,7104>;
-  // op 84: CONCATENATION
-  std::copy_n(t87.begin(),7008,t133.begin()+0);
-  std::copy_n(t132.begin(),96,t133.begin()+7008);
+  std::copy_n(tensor_129.begin(),tensor_129.size(),state_stream_20_states.begin());
+  {
+    ArrayView<std::int8_t,24> tensor_130(buffer_0.data());
+    // op 81: CONV_2D
+    dense(buffer_1,sg0_tensor17_bytes,sg0_tensor16_bytes,tensor_130,-128,-128,op81_mult,op81_shift,-128,127);
+  }
+  {
+    ArrayView<std::int8_t,72> tensor_131(buffer_1.data());
+    // op 82: CONCATENATION
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_3.data()).begin(),24,tensor_131.begin()+0);
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_2.data()).begin(),24,tensor_131.begin()+24);
+    std::copy_n(ArrayView<const std::int8_t,24>(buffer_0.data()).begin(),24,tensor_131.begin()+48);
+  }
+  {
+    auto& tensor_132=buffer_3;
+    // op 83: CONV_2D
+    dense(ArrayView<const std::int8_t,72>(buffer_1.data()),sg0_tensor15_bytes,sg0_tensor14_bytes,tensor_132,-128,-128,op83_mult,op83_shift,-128,127);
+  }
+  {
+    auto& tensor_133=buffer_0;
+    // op 84: CONCATENATION
+    std::copy_n(tensor_87.begin(),7008,tensor_133.begin()+0);
+    std::copy_n(buffer_3.begin(),96,tensor_133.begin()+7008);
+  }
   // op 85: ASSIGN_VARIABLE
-  std::copy_n(t133.begin(),t133.size(),state_stream_21_states.begin());
+  std::copy_n(buffer_0.begin(),buffer_0.size(),state_stream_21_states.begin());
   // op 86: RESHAPE
-  const auto& t134=t133;
-  auto& t135=*::new (static_cast<void*>(scratch_arena.data()+0)) std::array<std::int8_t,1>;
-  // op 87: FULLY_CONNECTED
-  dense(t134,sg0_tensor13_bytes,sg0_tensor12_bytes,t135,-128,23,op87_mult,op87_shift,-128,127);
-  auto& t136=*::new (static_cast<void*>(scratch_arena.data()+1)) std::array<std::int8_t,1>;
-  // op 88: LOGISTIC
-  t136[0]=logistic_lut[static_cast<std::uint8_t>(static_cast<int>(t135[0])+128)];
-  auto& t137=*::new (static_cast<void*>(scratch_arena.data()+0)) std::array<std::uint8_t,1>;
-  // op 89: QUANTIZE
-  t137[0]=static_cast<std::uint8_t>(static_cast<int>(t136[0])+128);
-  return t137[0];
+  const auto& tensor_134=buffer_0;
+  {
+    ArrayView<std::int8_t,1> tensor_135(buffer_3.data());
+    // op 87: FULLY_CONNECTED
+    dense(tensor_134,sg0_tensor13_bytes,sg0_tensor12_bytes,tensor_135,-128,23,op87_mult,op87_shift,-128,127);
+  }
+  {
+    std::array<std::int8_t,1> tensor_136;
+    // op 88: LOGISTIC
+    tensor_136[0]=logistic_lut[static_cast<std::uint8_t>(static_cast<int>(ArrayView<const std::int8_t,1>(buffer_3.data())[0])+128)];
+    std::copy_n(tensor_136.begin(),tensor_136.size(),buffer_3.begin());
+  }
+  {
+    auto& tensor_137=buffer_4;
+    // op 89: QUANTIZE
+    tensor_137[0]=static_cast<std::uint8_t>(static_cast<int>(ArrayView<const std::int8_t,1>(buffer_3.data())[0])+128);
+  }
+  return buffer_4[0];
 }
 }

@@ -14,10 +14,6 @@ def elements(tensor):
     return result
 
 
-def align_up(value, alignment):
-    return (value + alignment - 1) // alignment * alignment
-
-
 @dataclass(frozen=True)
 class Alias:
     tensor: int
@@ -26,13 +22,18 @@ class Alias:
 
 
 @dataclass(frozen=True)
-class Allocation:
+class StorageAllocation:
     tensor: int
-    start: int
-    end: int
+    slot: int
+    temporary: bool
+
+
+@dataclass(frozen=True)
+class StorageSlot:
+    index: int
+    type: str
+    elements: int
     bytes: int
-    alignment: int
-    offset: int
 
 
 @dataclass(frozen=True)
@@ -45,15 +46,20 @@ class KernelChoice:
 class LoweredProgram:
     target: str
     aliases: tuple
-    allocations: tuple
-    scratch_bytes: int
+    storage_allocations: tuple
+    storage_slots: tuple
+    working_memory_bytes: int
     kernels: tuple
-
-    def allocation(self, tensor):
-        return next((item for item in self.allocations if item.tensor == tensor), None)
 
     def kernel(self, op):
         return next((item.name for item in self.kernels if item.op == op), None)
+
+    def storage_slot(self, tensor):
+        allocation = self.storage_allocation(tensor)
+        return allocation.slot if allocation is not None else None
+
+    def storage_allocation(self, tensor):
+        return next((item for item in self.storage_allocations if item.tensor == tensor), None)
 
 
 def _find_aliases(graph, tensors):
@@ -74,7 +80,7 @@ def _find_aliases(graph, tensors):
     return tuple(aliases)
 
 
-def _allocate_scratch(graph, tensors, runtime_outputs, aliases):
+def _live_intervals(graph, tensors, runtime_outputs, aliases):
     producers = {}
     consumers = {}
     for op in graph["operators"]:
@@ -117,26 +123,64 @@ def _allocate_scratch(graph, tensors, runtime_outputs, aliases):
             "start": start,
             "end": end,
             "bytes": elements(tensor) * width,
-            "alignment": width,
         })
 
-    active = []
-    arena_size = 0
-    for interval in sorted(intervals, key=lambda item: (item["start"], -item["bytes"], item["tensor"])):
-        active = [item for item in active if item["end"] >= interval["start"]]
-        occupied = sorted((item["offset"], item["offset"] + item["bytes"]) for item in active)
-        offset = 0
-        for begin, end in occupied:
-            offset = align_up(offset, interval["alignment"])
-            if offset + interval["bytes"] <= begin:
-                break
-            offset = max(offset, end)
-        offset = align_up(offset, interval["alignment"])
-        interval["offset"] = offset
-        arena_size = max(arena_size, offset + interval["bytes"])
-        active.append(interval)
+    return intervals
 
-    return arena_size, tuple(Allocation(**item) for item in intervals)
+
+def _allocate_storage(graph, intervals, tensors, aliases):
+    intervals_by_tensor = {item["tensor"]: item for item in intervals}
+    alias_sources = {item.tensor: item.source for item in aliases}
+    fresh_outputs = set()
+    for op in graph["operators"]:
+        for output in op["outputs"]:
+            if output not in intervals_by_tensor:
+                continue
+            output_tensor = tensors[output]
+            for input_index in op["inputs"]:
+                source = input_index
+                while source in alias_sources:
+                    source = alias_sources[source]
+                source_interval = intervals_by_tensor.get(source)
+                if (source_interval is not None
+                        and source_interval["end"] == op["index"]
+                        and tensors[input_index]["type"] == output_tensor["type"]
+                        and elements(tensors[input_index]) == elements(output_tensor)):
+                    fresh_outputs.add(output)
+                    break
+
+    slots = []
+    allocations = []
+    for interval in sorted(intervals, key=lambda item: (item["start"], -item["bytes"], item["tensor"])):
+        tensor = tensors[interval["tensor"]]
+        temporary = interval["tensor"] in fresh_outputs
+        available = [item for item in slots
+                     if (item["type"] == tensor["type"]
+                         and (item["end"] <= interval["start"] if temporary
+                              else item["end"] < interval["start"]))]
+        slot = min(available, key=lambda item: max(item["bytes"], interval["bytes"]), default=None)
+        if slot is None:
+            slot = {"index": len(slots), "type": tensor["type"],
+                    "elements": elements(tensor),
+                    "bytes": interval["bytes"], "end": interval["end"]}
+            slots.append(slot)
+        else:
+            slot["end"] = interval["end"]
+            if interval["bytes"] > slot["bytes"]:
+                slot["bytes"] = interval["bytes"]
+                slot["elements"] = elements(tensor)
+        allocations.append(StorageAllocation(interval["tensor"], slot["index"], temporary))
+
+    persistent_bytes = sum(item["bytes"] for item in slots)
+    temporary_bytes = 0
+    for start in {item["start"] for item in intervals}:
+        temporary_bytes = max(temporary_bytes,
+                              sum(item["bytes"] for item in intervals
+                                  if item["start"] == start and item["tensor"] in fresh_outputs))
+    storage_slots = tuple(StorageSlot(item["index"], item["type"],
+                                     item["elements"], item["bytes"])
+                          for item in slots)
+    return persistent_bytes + temporary_bytes, tuple(allocations), storage_slots
 
 
 def lower_program(graph, tensors, target, kernels=(), omitted_outputs=()):
@@ -154,8 +198,11 @@ def lower_program(graph, tensors, target, kernels=(), omitted_outputs=()):
             and index not in alias_tensors
             and index not in omitted_outputs)
     })
-    scratch_bytes, allocations = _allocate_scratch(graph, tensors, runtime_outputs, aliases)
-    return LoweredProgram(target, aliases, allocations, scratch_bytes, tuple(kernels))
+    intervals = _live_intervals(graph, tensors, runtime_outputs, aliases)
+    working_bytes, storage_allocations, storage_slots = _allocate_storage(
+        graph, intervals, tensors, aliases)
+    return LoweredProgram(target, aliases, storage_allocations, storage_slots,
+                          working_bytes, tuple(kernels))
 
 
 def write_memory_reports(program, output_dir, tensors):
@@ -173,9 +220,10 @@ def write_memory_reports(program, output_dir, tensors):
             for item in program.aliases
         ],
     }, indent=2) + "\n")
-    (output_dir / "model.scratch-plan.json").write_text(json.dumps({
-        "format": "nn2prog-scratch-plan-v1",
-        "arena_bytes": program.scratch_bytes,
+    (output_dir / "model.storage-plan.json").write_text(json.dumps({
+        "format": "nn2prog-storage-plan-v1",
+        "working_memory_bytes": program.working_memory_bytes,
+        "slots": [item.__dict__ for item in program.storage_slots],
+        "allocations": [item.__dict__ for item in program.storage_allocations],
         "initialization": "producer-defined-no-zero-fill",
-        "allocations": [item.__dict__ for item in program.allocations],
     }, indent=2) + "\n")

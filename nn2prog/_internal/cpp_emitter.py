@@ -63,16 +63,25 @@ class CLASS_NAME {
   void reset();
   RETURN_TYPE invoke(const std::array<std::int8_t,INPUT_ELEMENTS>& input);
 """.replace("CLASS_NAME", class_name).replace("INPUT_ELEMENTS", str(input_elements)).replace("RETURN_TYPE", return_type))
-        h.write("  static std::size_t scratch_bytes();\n")
+        h.write("  static std::size_t working_memory_bytes();\n")
         h.write(""" private:
 """)
         for name, size in state_sizes.items():
             h.write(f"  std::array<std::int8_t,{size}> {state_field[name]}{{}};\n")
         h.write("};\n}\n")
 
+    def local(index): return f"tensor_{index}"
     def ptr(index):
         if index == input_tensor: return "input"
-        return f"t{index}"
+        slot = program.storage_slot(index)
+        if slot is not None:
+            storage = program.storage_slots[slot]
+            count = elements(tensors[index])
+            if storage.elements == count:
+                return f"buffer_{slot}"
+            typ = "std::uint8_t" if tensors[index]["type"] == "UINT8" else "std::int8_t"
+            return f"ArrayView<const {typ},{count}>(buffer_{slot}.data())"
+        return local(index)
     def raw(index): return f"sg0_tensor{index}_bytes"
     def nhwc(index):
         shape = tensors[index]["shape"]
@@ -94,7 +103,6 @@ class CLASS_NAME {
 #include <array>
 #include <cstdint>
 #include <limits>
-#include <new>
 #include <type_traits>
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -143,18 +151,18 @@ __attribute__((target("avx2"))) std::int32_t dot_16_zero_minus_128(const std::in
   return _mm_cvtsi128_si32(sums);
 }
 #endif
-template<std::size_t N,std::size_t W,std::size_t B,std::size_t O>
-void dense(const std::array<std::int8_t,N>& in,const std::array<std::uint8_t,W>& weights,const std::array<std::uint8_t,B>& bias,
-           std::array<std::int8_t,O>& out,int input_zero,int output_zero,const std::array<std::int32_t,O>& mult,const std::array<int,O>& shift,int amin,int amax) {
-  static_assert(W==N*O && B==O*4);
+template<std::size_t W,std::size_t B,std::size_t O,typename Input,typename Output>
+void dense(const Input& in,const std::array<std::uint8_t,W>& weights,const std::array<std::uint8_t,B>& bias,
+           Output& out,int input_zero,int output_zero,const std::array<std::int32_t,O>& mult,const std::array<int,O>& shift,int amin,int amax) {
+  static_assert(W%O==0 && B==O*4);constexpr std::size_t N=W/O;
   for(std::size_t oc=0;oc<O;++oc){ std::int32_t acc=load_i32(bias.data()+oc*4);
     for(std::size_t i=0;i<N;++i) acc += static_cast<std::int32_t>(signed_byte(weights[oc*N+i]))*(static_cast<int>(in[i])-input_zero);
     acc=requantize(acc,mult[oc],shift[oc])+output_zero; out[oc]=static_cast<std::int8_t>(std::clamp<std::int32_t>(acc,amin,amax)); }
 }
 template<std::size_t IH,std::size_t IW,std::size_t IC,std::size_t FH,std::size_t FW,std::size_t OC,
-         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B>
+         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B,typename Output>
 void conv2d_nhwc(const Input& in,const std::array<std::uint8_t,W>& weights,const std::array<std::uint8_t,B>& bias,
-           std::array<std::int8_t,OH*OW*OC>& out,int stride_h,int stride_w,int dilation_h,int dilation_w,
+           Output& out,int stride_h,int stride_w,int dilation_h,int dilation_w,
            int pad_h,int pad_w,int input_zero,int weight_zero,int output_zero,
            const std::array<std::int32_t,OC>& mult,const std::array<int,OC>& shift,int amin,int amax) {
   static_assert(W==OC*FH*FW*IC && B==OC*4);
@@ -175,9 +183,9 @@ void conv2d_nhwc(const Input& in,const std::array<std::uint8_t,W>& weights,const
   }
 }
 template<std::size_t IH,std::size_t IW,std::size_t IC,std::size_t OC,std::size_t OH,std::size_t OW,
-         typename Input,std::size_t W>
+         typename Input,std::size_t W,typename Output>
 NN2PROG_ESP32_IRAM void esp32_conv_1x1(const Input& in,const std::array<std::uint8_t,W>& weights,
-           const std::array<std::int32_t,OC>& adjusted_bias,std::array<std::int8_t,OH*OW*OC>& out,
+           const std::array<std::int32_t,OC>& adjusted_bias,Output& out,
            int stride_h,int stride_w,int output_zero,const std::array<std::int32_t,OC>& mult,
            const std::array<int,OC>& shift,int amin,int amax) {
   static_assert(W==OC*IC);
@@ -205,9 +213,9 @@ NN2PROG_ESP32_IRAM void esp32_conv_1x1(const Input& in,const std::array<std::uin
   }
 }
 template<std::size_t IH,std::size_t IW,std::size_t IC,std::size_t FH,std::size_t FW,std::size_t OC,
-         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B>
+         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B,typename Output>
 NN2PROG_ESP32_IRAM void esp32_conv_nhwc(const Input& in,const std::array<std::uint8_t,W>& weights,
-           const std::array<std::uint8_t,B>& bias,std::array<std::int8_t,OH*OW*OC>& out,
+           const std::array<std::uint8_t,B>& bias,Output& out,
            int stride_h,int stride_w,int pad_h,int pad_w,int input_zero,int output_zero,
            const std::array<std::int32_t,OC>& mult,const std::array<int,OC>& shift,int amin,int amax) {
   static_assert(W==OC*FH*FW*IC && B==OC*4);
@@ -241,9 +249,9 @@ NN2PROG_ESP32_IRAM void esp32_conv_nhwc(const Input& in,const std::array<std::ui
   }
 }
 template<std::size_t IH,std::size_t IW,std::size_t IC,std::size_t FH,std::size_t FW,std::size_t DM,
-         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B>
+         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B,typename Output>
 void depthwise_nhwc(const Input& in,const std::array<std::uint8_t,W>& weights,const std::array<std::uint8_t,B>& bias,
-           std::array<std::int8_t,OH*OW*IC*DM>& out,int stride_h,int stride_w,int dilation_h,int dilation_w,
+           Output& out,int stride_h,int stride_w,int dilation_h,int dilation_w,
            int pad_h,int pad_w,int input_zero,int weight_zero,int output_zero,
            const std::array<std::int32_t,IC*DM>& mult,const std::array<int,IC*DM>& shift,int amin,int amax) {
   constexpr std::size_t OC=IC*DM; static_assert(W==FH*FW*OC && B==OC*4);
@@ -262,9 +270,9 @@ void depthwise_nhwc(const Input& in,const std::array<std::uint8_t,W>& weights,co
   }
 }
 template<std::size_t IH,std::size_t IW,std::size_t C,std::size_t FH,std::size_t FW,
-         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B>
+         std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B,typename Output>
 NN2PROG_ESP32_IRAM void esp32_depthwise_channels4(const Input& in,const std::array<std::uint8_t,W>& weights,
-           const std::array<std::uint8_t,B>& bias,std::array<std::int8_t,OH*OW*C>& out,
+           const std::array<std::uint8_t,B>& bias,Output& out,
            int stride_h,int stride_w,int pad_h,int pad_w,int input_zero,int output_zero,
            const std::array<std::int32_t,C>& mult,const std::array<int,C>& shift,int amin,int amax) {
   static_assert(W==FH*FW*C && B==C*4 && C%4==0);
@@ -296,8 +304,8 @@ NN2PROG_ESP32_IRAM void esp32_depthwise_channels4(const Input& in,const std::arr
     }
   }
 }
-template<std::size_t IH,std::size_t IW,std::size_t C,std::size_t OH,std::size_t OW,typename Input>
-void average_pool_nhwc(const Input& in,std::array<std::int8_t,OH*OW*C>& out,int filter_h,int filter_w,
+template<std::size_t IH,std::size_t IW,std::size_t C,std::size_t OH,std::size_t OW,typename Input,typename Output>
+void average_pool_nhwc(const Input& in,Output& out,int filter_h,int filter_w,
            int stride_h,int stride_w,int pad_h,int pad_w,int amin,int amax) {
   for(std::size_t oy=0;oy<OH;++oy)for(std::size_t ox=0;ox<OW;++ox)for(std::size_t c=0;c<C;++c){
     std::int32_t sum=0;int count=0;
@@ -310,9 +318,9 @@ void average_pool_nhwc(const Input& in,std::array<std::int8_t,OH*OW*C>& out,int 
     out[(oy*OW+ox)*C+c]=static_cast<std::int8_t>(std::clamp(rounded,amin,amax));
   }
 }
-template<typename Input,std::size_t W,std::size_t B,std::size_t O>
+template<typename Input,std::size_t W,std::size_t B,std::size_t O,typename Output>
 void depthwise_single_output(const Input& in,const std::array<std::uint8_t,W>& weights,
-           const std::array<std::uint8_t,B>& bias,std::array<std::int8_t,O>& out,int input_zero,int output_zero,
+           const std::array<std::uint8_t,B>& bias,Output& out,int input_zero,int output_zero,
            const std::array<std::int32_t,O>& mult,const std::array<int,O>& shift,int amin,int amax) {
   static_assert(B==O*4 && W%O==0); constexpr std::size_t Kernel=W/O;
   for(std::size_t channel=0;channel<O;++channel){std::int32_t acc=load_i32(bias.data()+channel*4);
@@ -321,9 +329,9 @@ void depthwise_single_output(const Input& in,const std::array<std::uint8_t,W>& w
     acc=requantize(acc,mult[channel],shift[channel])+output_zero;
     out[channel]=static_cast<std::int8_t>(std::clamp<std::int32_t>(acc,amin,amax));}
 }
-template<std::size_t Block,typename Input,std::size_t W,std::size_t B,std::size_t O>
+template<std::size_t Block,typename Input,std::size_t W,std::size_t B,std::size_t O,typename Output>
 void dense_masked_simd_blocks(const Input& in,const std::array<std::uint8_t,W>& weights,const std::array<std::uint8_t,B>& bias,
-           std::array<std::int8_t,O>& out,int input_zero,int output_zero,const std::array<std::int32_t,O>& mult,
+           Output& out,int input_zero,int output_zero,const std::array<std::int32_t,O>& mult,
            const std::array<int,O>& shift,int amin,int amax) {
   constexpr std::size_t N=W/O, Blocks=(N+Block-1)/Block;static_assert(W==N*O && B==O*4);
   using BlockIndex=std::conditional_t<(Blocks<=256),std::uint8_t,std::uint16_t>;
@@ -349,13 +357,14 @@ template<typename T,std::size_t N> class ArrayView {
   explicit ArrayView(T* data):data_(data){}
   T* begin() const{return data_;} T* end() const{return data_+N;} T* data() const{return data_;}
   constexpr std::size_t size() const{return N;} T& operator[](std::size_t i) const{return data_[i];}
+  void fill(std::remove_const_t<T> value) const{std::fill(begin(),end(),value);}
  private: T* data_;
 };
 """)
         if any(op["opcode"] == "PAD" for op in ops):
             c.write("""
-template<std::size_t Rank,std::size_t N,std::size_t O,typename Input>
-void pad_tensor(const Input& in,std::array<std::int8_t,O>& out,
+template<std::size_t Rank,std::size_t N,std::size_t O,typename Input,typename Output>
+void pad_tensor(const Input& in,Output& out,
                 const std::array<std::size_t,Rank>& input_shape,
                 const std::array<std::size_t,Rank>& output_shape,
                 const std::array<std::size_t,Rank>& before,std::int8_t zero) {
@@ -375,8 +384,8 @@ void pad_tensor(const Input& in,std::array<std::int8_t,O>& out,
 """)
         if any(op["opcode"] == "MEAN" for op in ops):
             c.write("""
-template<std::size_t Rank,std::size_t N,std::size_t O,typename Input>
-void mean_tensor(const Input& in,std::array<std::int8_t,O>& out,
+template<std::size_t Rank,std::size_t N,std::size_t O,typename Input,typename Output>
+void mean_tensor(const Input& in,Output& out,
                  const std::array<std::size_t,Rank>& input_shape,
                  const std::array<bool,Rank>& reduced,std::size_t count,
                  int input_zero,int output_zero,std::int32_t multiplier,int shift) {
@@ -404,40 +413,51 @@ void mean_tensor(const Input& in,std::array<std::int8_t,O>& out,
         for name in state_sizes:
             c.write(f"  {state_field[name]}.fill(static_cast<std::int8_t>({state_zero_points[name]}));\n")
         c.write("}\n")
-        c.write(f"\nstd::size_t {class_name}::scratch_bytes(){{return {program.scratch_bytes};}}\n")
+        c.write(f"\nstd::size_t {class_name}::working_memory_bytes(){{return {program.working_memory_bytes};}}\n")
         c.write(f"\nNN2PROG_ESP32_IRAM {return_type} {class_name}::invoke(const std::array<std::int8_t,{input_elements}>& input){{\n")
-        c.write(f"  alignas(8) std::array<std::uint8_t,{program.scratch_bytes}> scratch_arena;\n")
+        for slot in program.storage_slots:
+            typ = "std::uint8_t" if slot.type == "UINT8" else "std::int8_t"
+            c.write(f"  std::array<{typ},{slot.elements}> buffer_{slot.index};\n")
         for op in ops:
             code=op["opcode"]; ins=op["inputs"]; outs=op["outputs"]
             if code in ("CALL_ONCE","VAR_HANDLE"): continue
-            for index in outs:
-                allocation = program.allocation(index)
-                if allocation is None: continue
-                typ = "std::uint8_t" if tensors[index]["type"] == "UINT8" else "std::int8_t"
-                c.write(f"  auto& t{index}=*::new (static_cast<void*>(scratch_arena.data()+{allocation.offset})) std::array<{typ},{elements(tensors[index])}>;\n")
-            c.write(f"  // op {op['index']}: {code}\n")
+            stored_outputs = [index for index in outs if program.storage_slot(index) is not None]
+            if stored_outputs:
+                c.write("  {\n")
+                for index in stored_outputs:
+                    typ = "std::uint8_t" if tensors[index]["type"] == "UINT8" else "std::int8_t"
+                    allocation = program.storage_allocation(index)
+                    slot = program.storage_slots[allocation.slot]
+                    if allocation.temporary:
+                        c.write(f"    std::array<{typ},{elements(tensors[index])}> {local(index)};\n")
+                    elif slot.elements == elements(tensors[index]):
+                        c.write(f"    auto& {local(index)}=buffer_{allocation.slot};\n")
+                    else:
+                        c.write(f"    ArrayView<{typ},{elements(tensors[index])}> {local(index)}(buffer_{allocation.slot}.data());\n")
+            indent = "    " if stored_outputs else "  "
+            c.write(f"{indent}// op {op['index']}: {code}\n")
             kernel = program.kernel(op["index"])
             if code == "RESHAPE":
-                c.write(f"  const auto& t{outs[0]}={ptr(ins[0])};\n")
+                c.write(f"{indent}const auto& {local(outs[0])}={ptr(ins[0])};\n")
             elif code == "READ_VARIABLE":
                 field=state_field[handles[ins[0]]]
-                c.write(f"  const auto& t{outs[0]}={field};\n")
+                c.write(f"{indent}const auto& {local(outs[0])}={field};\n")
             elif code == "STRIDED_SLICE":
                 n=elements(tensors[outs[0]]); ni=elements(tensors[ins[0]])
-                c.write(f"  ArrayView<const std::int8_t,{n}> t{outs[0]}({ptr(ins[0])}.data()+{ni-n});\n")
+                c.write(f"{indent}ArrayView<const std::int8_t,{n}> {local(outs[0])}({ptr(ins[0])}.data()+{ni-n});\n")
             elif code == "SPLIT_V":
                 split = op["split_v"]
                 offset = 0
                 for output, size in zip(outs, split["sizes"]):
                     chunk = size * split["inner"]
-                    c.write(f"  for(std::size_t outer=0;outer<{split['outer']};++outer) "
+                    c.write(f"{indent}for(std::size_t outer=0;outer<{split['outer']};++outer) "
                             f"std::copy_n({ptr(ins[0])}.data()+outer*{split['axis_size'] * split['inner']}+{offset * split['inner']},"
-                            f"{chunk},t{output}.data()+outer*{chunk});\n")
+                            f"{chunk},{local(output)}.data()+outer*{chunk});\n")
                     offset += size
             elif code == "PAD":
                 inp=ins[0];o=outs[0];shape=tensors[inp]["shape"];oshape=tensors[o]["shape"]
                 rank=len(shape);before=op["pad"]["before"];zero=tensors[inp]["quantization"]["zero_point"][0]
-                c.write(f"  pad_tensor<{rank},{elements(tensors[inp])},{elements(tensors[o])}>({ptr(inp)},t{o},"
+                c.write(f"{indent}pad_tensor<{rank},{elements(tensors[inp])},{elements(tensors[o])}>({ptr(inp)},{local(o)},"
                         f"std::array<std::size_t,{rank}>{{{','.join(map(str,shape))}}},"
                         f"std::array<std::size_t,{rank}>{{{','.join(map(str,oshape))}}},"
                         f"std::array<std::size_t,{rank}>{{{','.join(map(str,before))}}},static_cast<std::int8_t>({zero}));\n")
@@ -445,17 +465,17 @@ void mean_tensor(const Input& in,std::array<std::int8_t,O>& out,
                 inp=ins[0];o=outs[0];shape=tensors[inp]["shape"];rank=len(shape);mean=op["mean"]
                 reduced=["true" if index in mean["axes"] else "false" for index in range(rank)]
                 iq=tensors[inp]["quantization"];oq=tensors[o]["quantization"]
-                c.write(f"  mean_tensor<{rank},{elements(tensors[inp])},{elements(tensors[o])}>({ptr(inp)},t{o},"
+                c.write(f"{indent}mean_tensor<{rank},{elements(tensors[inp])},{elements(tensors[o])}>({ptr(inp)},{local(o)},"
                         f"std::array<std::size_t,{rank}>{{{','.join(map(str,shape))}}},"
                         f"std::array<bool,{rank}>{{{','.join(reduced)}}},{mean['count']},"
                         f"{iq['zero_point'][0]},{oq['zero_point'][0]},{mean['multiplier']},{mean['shift']});\n")
             elif code == "CONCATENATION":
                 offset=0
                 for x in ins:
-                    n=elements(tensors[x]); c.write(f"  std::copy_n({ptr(x)}.begin(),{n},t{outs[0]}.begin()+{offset});\n"); offset+=n
+                    n=elements(tensors[x]); c.write(f"{indent}std::copy_n({ptr(x)}.begin(),{n},{local(outs[0])}.begin()+{offset});\n"); offset+=n
             elif code == "ASSIGN_VARIABLE":
                 field=state_field[handles[ins[0]]]
-                c.write(f"  std::copy_n({ptr(ins[1])}.begin(),{ptr(ins[1])}.size(),{field}.begin());\n")
+                c.write(f"{indent}std::copy_n({ptr(ins[1])}.begin(),{ptr(ins[1])}.size(),{field}.begin());\n")
             elif code in ("CONV_2D","FULLY_CONNECTED"):
                 inp,w,b=ins[:3]; o=outs[0]; iq=tensors[inp]["quantization"]; oq=tensors[o]["quantization"]
                 lo=op["lower"]
@@ -467,14 +487,14 @@ void mean_tensor(const Input& in,std::array<std::int8_t,O>& out,
                     ph=padding_before(ih,oh,fh,sh,dh,opts["padding"]);pw=padding_before(iw,ow,fw,sw,dw,opts["padding"])
                     wz=tensors[w]["quantization"]["zero_point"][0]
                     if kernel == "esp32_conv_1x1_unrolled8_bias_fold":
-                        c.write(f"  esp32_conv_1x1<{ih},{iw},{ic},{oc},{oh},{ow}>({ptr(inp)},{raw(w)},op{op['index']}_esp32_bias,t{o},{sh},{sw},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
+                        c.write(f"{indent}esp32_conv_1x1<{ih},{iw},{ic},{oc},{oh},{ow}>({ptr(inp)},{raw(w)},op{op['index']}_esp32_bias,{local(o)},{sh},{sw},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
                     elif kernel == "esp32_conv_nhwc_unrolled8":
-                        c.write(f"  esp32_conv_nhwc<{ih},{iw},{ic},{fh},{fw},{oc},{oh},{ow}>({ptr(inp)},{raw(w)},{raw(b)},t{o},{sh},{sw},{ph},{pw},{iq['zero_point'][0]},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
+                        c.write(f"{indent}esp32_conv_nhwc<{ih},{iw},{ic},{fh},{fw},{oc},{oh},{ow}>({ptr(inp)},{raw(w)},{raw(b)},{local(o)},{sh},{sw},{ph},{pw},{iq['zero_point'][0]},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
                     else:
-                        c.write(f"  conv2d_nhwc<{ih},{iw},{ic},{fh},{fw},{oc},{oh},{ow}>({ptr(inp)},{raw(w)},{raw(b)},t{o},{sh},{sw},{dh},{dw},{ph},{pw},{iq['zero_point'][0]},{wz},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
+                        c.write(f"{indent}conv2d_nhwc<{ih},{iw},{ic},{fh},{fw},{oc},{oh},{ow}>({ptr(inp)},{raw(w)},{raw(b)},{local(o)},{sh},{sw},{dh},{dw},{ph},{pw},{iq['zero_point'][0]},{wz},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
                 elif kernel == "x86_dense_masked_simd32":
-                    c.write(f"  dense_masked_simd_blocks<{masked_simd_block}>({ptr(inp)},{raw(w)},{raw(b)},t{o},{iq['zero_point'][0]},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
-                else: c.write(f"  dense({ptr(inp)},{raw(w)},{raw(b)},t{o},{iq['zero_point'][0]},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
+                    c.write(f"{indent}dense_masked_simd_blocks<{masked_simd_block}>({ptr(inp)},{raw(w)},{raw(b)},{local(o)},{iq['zero_point'][0]},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
+                else: c.write(f"{indent}dense({ptr(inp)},{raw(w)},{raw(b)},{local(o)},{iq['zero_point'][0]},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
             elif code == "DEPTHWISE_CONV_2D":
                 inp,w,b=ins[:3];o=outs[0];iq=tensors[inp]["quantization"];oq=tensors[o]["quantization"];lo=op["lower"]
                 if (op["options"].get("padding") == "VALID" and op["options"].get("stride_w") == 1
@@ -482,7 +502,7 @@ void mean_tensor(const Input& in,std::array<std::int8_t,O>& out,
                       and op["options"].get("dilation_h") == 1 and op["options"].get("depth_multiplier") == 1
                       and elements(tensors[inp]) == elements(tensors[w])
                       and elements(tensors[o]) == tensors[o]["shape"][-1]):
-                    c.write(f"  depthwise_single_output({ptr(inp)},{raw(w)},{raw(b)},t{o},{iq['zero_point'][0]},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
+                    c.write(f"{indent}depthwise_single_output({ptr(inp)},{raw(w)},{raw(b)},{local(o)},{iq['zero_point'][0]},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
                 else:
                     ih,iw,ic=nhwc(inp);oh,ow,oc=nhwc(o);one,fh,fw,woc=tensors[w]["shape"]
                     dm=op["options"]["depth_multiplier"]
@@ -491,37 +511,50 @@ void mean_tensor(const Input& in,std::array<std::int8_t,O>& out,
                     ph=padding_before(ih,oh,fh,sh,dh,opts["padding"]);pw=padding_before(iw,ow,fw,sw,dw,opts["padding"])
                     wz=tensors[w]["quantization"]["zero_point"][0]
                     if kernel == "esp32_depthwise_channels4":
-                        c.write(f"  esp32_depthwise_channels4<{ih},{iw},{ic},{fh},{fw},{oh},{ow}>({ptr(inp)},{raw(w)},{raw(b)},t{o},{sh},{sw},{ph},{pw},{iq['zero_point'][0]},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
+                        c.write(f"{indent}esp32_depthwise_channels4<{ih},{iw},{ic},{fh},{fw},{oh},{ow}>({ptr(inp)},{raw(w)},{raw(b)},{local(o)},{sh},{sw},{ph},{pw},{iq['zero_point'][0]},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
                     else:
-                        c.write(f"  depthwise_nhwc<{ih},{iw},{ic},{fh},{fw},{dm},{oh},{ow}>({ptr(inp)},{raw(w)},{raw(b)},t{o},{sh},{sw},{dh},{dw},{ph},{pw},{iq['zero_point'][0]},{wz},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
+                        c.write(f"{indent}depthwise_nhwc<{ih},{iw},{ic},{fh},{fw},{dm},{oh},{ow}>({ptr(inp)},{raw(w)},{raw(b)},{local(o)},{sh},{sw},{dh},{dw},{ph},{pw},{iq['zero_point'][0]},{wz},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
             elif code == "AVERAGE_POOL_2D":
                 inp=ins[0];o=outs[0];ih,iw,channels=nhwc(inp);oh,ow,ochannels=nhwc(o)
                 if channels != ochannels: raise ValueError(f"AVERAGE_POOL_2D channel mismatch at op {op['index']}")
                 opts=op["options"];fh=opts["filter_h"];fw=opts["filter_w"];sh=opts["stride_h"];sw=opts["stride_w"]
                 ph=padding_before(ih,oh,fh,sh,1,opts["padding"]);pw=padding_before(iw,ow,fw,sw,1,opts["padding"])
                 lo=op["lower"]
-                c.write(f"  average_pool_nhwc<{ih},{iw},{channels},{oh},{ow}>({ptr(inp)},t{o},{fh},{fw},{sh},{sw},{ph},{pw},{lo['amin']},{lo['amax']});\n")
+                c.write(f"{indent}average_pool_nhwc<{ih},{iw},{channels},{oh},{ow}>({ptr(inp)},{local(o)},{fh},{fw},{sh},{sw},{ph},{pw},{lo['amin']},{lo['amax']});\n")
             elif code == "MUL":
                 a,b=ins;o=outs[0];aq,bq,oq=(tensors[x]["quantization"] for x in (a,b,o));lo=op["lower"]; bn=elements(tensors[b])
-                c.write(f"  for(std::size_t i=0;i<t{o}.size();++i){{int av=static_cast<int>({ptr(a)}[i])-({aq['zero_point'][0]});int bv=static_cast<int>(signed_byte({raw(b)}[i%{bn}]))-({bq['zero_point'][0]});int v=requantize(av*bv,{lo['m']},{lo['s']})+({oq['zero_point'][0]});t{o}[i]=static_cast<std::int8_t>(std::clamp(v,{lo['amin']},{lo['amax']}));}}\n")
+                c.write(f"{indent}for(std::size_t i=0;i<{local(o)}.size();++i){{int av=static_cast<int>({ptr(a)}[i])-({aq['zero_point'][0]});int bv=static_cast<int>(signed_byte({raw(b)}[i%{bn}]))-({bq['zero_point'][0]});int v=requantize(av*bv,{lo['m']},{lo['s']})+({oq['zero_point'][0]});{local(o)}[i]=static_cast<std::int8_t>(std::clamp(v,{lo['amin']},{lo['amax']}));}}\n")
             elif code == "ADD":
                 a,b=ins;o=outs[0];aq,bq,oq=(tensors[x]["quantization"] for x in (a,b,o));lo=op["lower"];bn=elements(tensors[b])
                 bvalue=(f"signed_byte({raw(b)}[i%{bn}])" if tensors[b]["buffer_bytes"]
                         else f"{ptr(b)}[i%{bn}]")
-                c.write(f"  for(std::size_t i=0;i<t{o}.size();++i){{int av=(static_cast<int>({ptr(a)}[i])-({aq['zero_point'][0]}))*(1<<{lo['left']});int bv=(static_cast<int>({bvalue})-({bq['zero_point'][0]}))*(1<<{lo['left']});int x=requantize(av,{lo['m1']},{lo['s1']})+requantize(bv,{lo['m2']},{lo['s2']});int v=requantize(x,{lo['mo']},{lo['so']})+({oq['zero_point'][0]});t{o}[i]=static_cast<std::int8_t>(std::clamp(v,{lo['amin']},{lo['amax']}));}}\n")
+                c.write(f"{indent}for(std::size_t i=0;i<{local(o)}.size();++i){{int av=(static_cast<int>({ptr(a)}[i])-({aq['zero_point'][0]}))*(1<<{lo['left']});int bv=(static_cast<int>({bvalue})-({bq['zero_point'][0]}))*(1<<{lo['left']});int x=requantize(av,{lo['m1']},{lo['s1']})+requantize(bv,{lo['m2']},{lo['s2']});int v=requantize(x,{lo['mo']},{lo['so']})+({oq['zero_point'][0]});{local(o)}[i]=static_cast<std::int8_t>(std::clamp(v,{lo['amin']},{lo['amax']}));}}\n")
             elif code == "LOGISTIC":
-                c.write(f"  t{outs[0]}[0]=logistic_lut[static_cast<std::uint8_t>(static_cast<int>({ptr(ins[0])}[0])+128)];\n")
+                c.write(f"{indent}{local(outs[0])}[0]=logistic_lut[static_cast<std::uint8_t>(static_cast<int>({ptr(ins[0])}[0])+128)];\n")
             elif code == "QUANTIZE":
-                c.write(f"  t{outs[0]}[0]=static_cast<std::uint8_t>(static_cast<int>({ptr(ins[0])}[0])+128);\n")
+                c.write(f"{indent}{local(outs[0])}[0]=static_cast<std::uint8_t>(static_cast<int>({ptr(ins[0])}[0])+128);\n")
             elif code == "SOFTMAX" and argmax_output:
-                c.write("  // Class decision is argmax(logits); softmax is monotone and unnecessary for top-1.\n")
+                c.write(f"{indent}// Class decision is argmax(logits); softmax is monotone and unnecessary for top-1.\n")
             else: raise ValueError(f"unsupported runtime op {code}")
+            for index in stored_outputs:
+                allocation = program.storage_allocation(index)
+                if not allocation.temporary:
+                    continue
+                slot = allocation.slot
+                if program.storage_slots[slot].elements == elements(tensors[index]):
+                    c.write(f"    buffer_{slot}={local(index)};\n")
+                else:
+                    c.write(f"    std::copy_n({local(index)}.begin(),{local(index)}.size(),buffer_{slot}.begin());\n")
+            if stored_outputs:
+                c.write("  }\n")
         if argmax_output:
             count=elements(tensors[decision_tensor])
-            c.write(f"  std::uint8_t decision=0;for(std::size_t i=1;i<{count};++i)if(t{decision_tensor}[i]>t{decision_tensor}[decision])decision=static_cast<std::uint8_t>(i);\n")
-            c.write("  return decision;\n}\n}\n")
+            decision = ptr(decision_tensor)
+            c.write(f"  const auto& logits={decision};\n")
+            c.write(f"  std::uint8_t result=0;for(std::size_t i=1;i<{count};++i)if(logits[i]>logits[result])result=static_cast<std::uint8_t>(i);\n")
+            c.write("  return result;\n}\n}\n")
         elif output_elements == 1:
-            c.write(f"  return t{output_tensor}[0];\n}}\n}}\n")
+            c.write(f"  return {ptr(output_tensor)}[0];\n}}\n}}\n")
         else:
             c.write(f"  std::array<std::int8_t,{output_elements}> result{{}};"
                     f"std::copy_n({ptr(output_tensor)}.begin(),{output_elements},result.begin());return result;\n}}\n}}\n")

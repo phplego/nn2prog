@@ -24,13 +24,13 @@ models.
 
 MLPerf Tiny KWS, identical int8 inputs and top-1 decision semantics:
 
-| Target | Reference | Reference latency | NN2Prog latency | Speedup | Working arena | Program size |
+| Target | Reference | Reference latency | NN2Prog latency | Speedup | Working memory | Program size |
 |---|---|---:|---:|---:|---:|---:|
-| ESP32-D0WD-V3, 240 MHz | TFLite Micro + ESP-NN | 161.72 ms | **140.30 ms** | **1.153x** | 22,780 → **16,000 B** | flash 287,039 → **185,915 B** |
-| Intel i7-11390H, GCC 13.3 `-O3` | TFLite Micro reference kernels | 7.771 ms | **2.499 ms** | **3.11x** | 24,000 → **16,000 B** | stripped executable 125,840 → **43,136 B** |
+| ESP32-D0WD-V3, 240 MHz | TFLite Micro + ESP-NN | 161.72 ms | **135.37 ms** | **1.195x** | 22,780 → **16,064 B** | flash 287,039 → **187,799 B** |
+| Intel i7-11390H, GCC 13.3 `-O3` | TFLite Micro reference kernels | 7.432 ms | **2.383 ms** | **3.12x** | 24,000 → **16,064 B** | stripped executable 125,840 → **43,136 B** |
 
-The ESP32 result is the primary embedded comparison: 35.2% less flash, 29.8%
-less engine working memory and 1.153x higher model-only throughput than TFLite
+The ESP32 result is the primary embedded comparison: 34.6% less flash, 29.5%
+less engine working memory and 1.195x higher model-only throughput than TFLite
 Micro with ESP-NN. The larger x86 speedup is included as a portability result,
 but its baseline uses TFLite Micro's portable reference kernels and should not
 be interpreted as a comparison with an optimized x86 inference engine.
@@ -113,10 +113,10 @@ nn2prog::generated::Model model;
 auto result = model.invoke(input);
 ```
 
-The compiler automatically applies zero-copy views, scratch-arena reuse and
-applicable target kernels. A scalar model returns its output byte; a classifier
-ending in softmax returns the top-1 class. No class name or output mode has to be
-configured by hand.
+The compiler automatically derives tensor lifetimes, reuses typed buffers and
+selects applicable target kernels. A scalar model returns its output byte; a
+classifier ending in softmax returns the top-1 class. No class name or output
+mode has to be configured by hand.
 
 ## ESP32
 

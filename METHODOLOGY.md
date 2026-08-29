@@ -55,6 +55,21 @@ Target kernels are selected from graph shapes, quantization and statically
 checked integer ranges. All generated arithmetic preserves the model result at
 the API boundary used by the corresponding example.
 
+## Research roadmap: certified decision execution
+
+The published compiler currently preserves the model result at its documented
+API boundary. A separate research direction is investigating `decision_exact`
+execution for applications that require only a fixed threshold decision or
+`argmax`: compute lower and upper bounds, stop once the original model's
+decision is formally determined, and otherwise continue through an exact
+fallback while reusing completed work.
+
+This is not a currently implemented NN2Prog feature and is not model
+distillation. Any future shortcut must be proved over its complete declared
+input and state region; corpus data may measure its coverage after generation
+but cannot establish correctness. Streaming models additionally require an
+equivalent next state, not merely the same current decision.
+
 ## Validation
 
 MLPerf Tiny KWS was compared with TFLite Micro on 1,024 deterministic full-range

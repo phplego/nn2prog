@@ -40,6 +40,7 @@ class StorageSlot:
 class KernelChoice:
     op: int
     name: str
+    scratch_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -201,6 +202,7 @@ def lower_program(graph, tensors, target, kernels=(), omitted_outputs=()):
     intervals = _live_intervals(graph, tensors, runtime_outputs, aliases)
     working_bytes, storage_allocations, storage_slots = _allocate_storage(
         graph, intervals, tensors, aliases)
+    working_bytes += max((item.scratch_bytes for item in kernels), default=0)
     return LoweredProgram(target, aliases, storage_allocations, storage_slots,
                           working_bytes, tuple(kernels))
 

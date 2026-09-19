@@ -95,8 +95,11 @@ class CLASS_NAME {
         return max(0, (output_size - 1) * stride + effective - input_size) // 2
     source = out / "model.cpp"
     with source.open("w") as c:
-        if target == "esp32":
+        if target in ("esp32", "esp32s3"):
             c.write("#define NN2PROG_GENERATED_ESP32 1\n")
+        if target == "esp32s3":
+            c.write('#if defined(ESP_PLATFORM)\n#include "sdkconfig.h"\n#endif\n')
+            c.write('#include <utility>\n')
         c.write("""#include "model.h"
 #include "model.constants.h"
 #include <algorithm>
@@ -119,9 +122,14 @@ std::int32_t load_i32(const std::uint8_t* p) { return static_cast<std::int32_t>(
 std::int32_t saturating_high_mul(std::int32_t a, std::int32_t b) {
   if (a == std::numeric_limits<std::int32_t>::min() && b == a) return std::numeric_limits<std::int32_t>::max();
   const std::int64_t product=static_cast<std::int64_t>(a)*b;
-  const std::int64_t nudge=product>=0 ? (std::int64_t{1}<<30) : (1-(std::int64_t{1}<<30));
+""")
+        if target == "esp32s3":
+            c.write("  return static_cast<std::int32_t>((product+(std::int64_t{1}<<30))>>31);\n")
+        else:
+            c.write("""  const std::int64_t nudge=product>=0 ? (std::int64_t{1}<<30) : (1-(std::int64_t{1}<<30));
   return static_cast<std::int32_t>((product+nudge)/(std::int64_t{1}<<31));
-}
+""")
+        c.write("""}
 std::int32_t rounding_divide_pot(std::int32_t x,int exponent) {
   if (!exponent) return x;
   const std::uint32_t mask=(std::uint32_t{1}<<exponent)-1;
@@ -159,7 +167,257 @@ void dense(const Input& in,const std::array<std::uint8_t,W>& weights,const std::
     for(std::size_t i=0;i<N;++i) acc += static_cast<std::int32_t>(signed_byte(weights[oc*N+i]))*(static_cast<int>(in[i])-input_zero);
     acc=requantize(acc,mult[oc],shift[oc])+output_zero; out[oc]=static_cast<std::int8_t>(std::clamp<std::int32_t>(acc,amin,amax)); }
 }
+""")
+        if target == "esp32s3":
+            c.write("""// Both pointers must be 16-byte aligned; N is padded with zero weights.
+template<std::size_t N>
+inline std::int32_t s3_dot16(const std::int8_t* input,const std::int8_t* weights) {
+  static_assert(N>0 && N%16==0);
+#if defined(__XTENSA__) && defined(CONFIG_IDF_TARGET_ESP32S3)
+  std::int32_t result;
+  if constexpr(N<=64) {
+    __asm__ volatile(
+      "ee.zero.accx\\n"
+      ".rept %[count]\\n"
+      "ee.vld.128.ip q0, %[x], 16\\n"
+      "ee.vld.128.ip q1, %[w], 16\\n"
+      "ee.vmulas.s8.accx q0, q1\\n"
+      ".endr\\n"
+      "nop\\n"
+      "nop\\n"
+      "rur.accx_0 %[r]\\n"
+      : [x] "+&r"(input), [w] "+&r"(weights), [r] "=r"(result)
+      : [count] "i"(N/16) : "memory");
+  } else {
+    unsigned blocks=N/16;
+    __asm__ volatile(
+      "ee.zero.accx\\n"
+      "1: ee.vld.128.ip q0, %[x], 16\\n"
+      "ee.vld.128.ip q1, %[w], 16\\n"
+      "ee.vmulas.s8.accx q0, q1\\n"
+      "addi %[n], %[n], -1\\n"
+      "bnez %[n], 1b\\n"
+      "nop\\n"
+      "nop\\n"
+      "rur.accx_0 %[r]\\n"
+      : [x] "+&r"(input), [w] "+&r"(weights), [n] "+&r"(blocks), [r] "=r"(result)
+      : : "memory");
+  }
+  return result;
+#else
+  std::int32_t result=0;
+  for(std::size_t i=0;i<N;++i)result+=static_cast<std::int32_t>(input[i])*weights[i];
+  return result;
+#endif
+}
+// S8 QACC stores sixteen signed 20-bit lane sums in two 160-bit halves.
+// The compiler proves that no lane overflows before selecting this kernel.
+template<std::size_t C>
+inline void s3_depthwise_sums(const std::int8_t* input,const std::int8_t* weights,std::uint8_t* raw) {
+#if defined(__XTENSA__) && defined(CONFIG_IDF_TARGET_ESP32S3)
+  unsigned taps=9;
+  __asm__ volatile(
+    "ee.zero.qacc\\n"
+    "1: ee.vld.128.xp q0, %[x], %[stride]\\n"
+    "ee.vld.128.xp q1, %[w], %[stride]\\n"
+    "ee.vmulas.s8.qacc q0, q1\\n"
+    "addi %[n], %[n], -1\\n"
+    "bnez %[n], 1b\\n"
+    "ee.st.qacc_l.l.128.ip %[s], 16\\n"
+    "ee.st.qacc_l.h.32.ip %[s], 16\\n"
+    "ee.st.qacc_h.l.128.ip %[s], 16\\n"
+    "ee.st.qacc_h.h.32.ip %[s], 0\\n"
+    : [x] "+&r"(input), [w] "+&r"(weights), [n] "+&r"(taps), [s] "+&r"(raw)
+    : [stride] "r"(C) : "memory");
+#else
+  for(unsigned c=0;c<16;c+=2){
+    std::int32_t a=0,b=0;
+    for(unsigned tap=0;tap<9;++tap){a+=int(input[tap*C+c])*weights[tap*C+c];b+=int(input[tap*C+c+1])*weights[tap*C+c+1];}
+    const auto u=static_cast<std::uint32_t>(a)&0xfffffu,v=static_cast<std::uint32_t>(b)&0xfffffu;
+    auto* p=raw+(c/8)*32+((c%8)/2)*5;
+    p[0]=u;p[1]=u>>8;p[2]=(u>>16)|(v<<4);p[3]=v>>4;p[4]=v>>12;
+  }
+#endif
+}
+inline std::uint32_t s3_load_word(const std::uint8_t* p) {
+#if defined(__XTENSA__) && defined(CONFIG_IDF_TARGET_ESP32S3)
+  // QACC storage and every requested word offset are four-byte aligned.
+  std::uint32_t value;
+  __asm__("l32i %0, %1, 0" : "=r"(value) : "r"(p) : "memory");
+  return value;
+#else
+  return static_cast<std::uint32_t>(load_i32(p));
+#endif
+}
+template<unsigned Lane>
+inline std::int32_t s3_lane20_fixed(const std::uint8_t* raw) {
+  static_assert(Lane<16);
+  constexpr unsigned bit=(Lane%8)*20, word=bit/32, shift=bit%32;
+  const auto* p=raw+(Lane/8)*32+word*4;
+  const auto lo=s3_load_word(p);
+  auto u=lo>>shift;
+  if constexpr(shift>12)u|=s3_load_word(p+4)<<(32-shift);
+  return static_cast<std::int32_t>(u<<12)>>12;
+}
+template<std::size_t C>
+constexpr bool s3_right_shift_only(const std::array<std::int32_t,C>& mult,const std::array<int,C>& shift) {
+  for(std::size_t c=0;c<C;++c)if(mult[c]<0 || shift[c]>=0 || shift[c]<-31)return false;
+  return true;
+}
+template<bool RightShiftOnly>
+inline std::int32_t s3_output_scale(std::int32_t x,std::int32_t mult,int shift) {
+  if constexpr(!RightShiftOnly)return requantize(x,mult,shift);
+  else {
+    // Nonnegative multiplier excludes INT32_MIN * INT32_MIN; no left shift.
+    const auto high=static_cast<std::int32_t>((std::int64_t(x)*mult+(std::int64_t{1}<<30))>>31);
+    const unsigned right=-shift;
+    const std::uint32_t mask=(std::uint32_t{1}<<right)-1;
+    return (high>>right)+((static_cast<std::uint32_t>(high)&mask)>((mask>>1)+(high<0)));
+  }
+}
+template<bool RightShiftOnly=false,std::size_t... Lane>
+NN2PROG_ESP32_IRAM inline void s3_output16(const std::uint8_t* raw,const std::int32_t* bias,
+    const std::int32_t* mult,const int* shift,std::int8_t* out,int oz,int amin,int amax,
+    std::index_sequence<Lane...>) {
+  ((out[Lane]=static_cast<std::int8_t>(std::clamp<std::int32_t>(
+      s3_output_scale<RightShiftOnly>(bias[Lane]+s3_lane20_fixed<Lane>(raw),mult[Lane],shift[Lane])+oz,amin,amax))),...);
+}
+// Weights: [input channel][16 output lanes]; the compiler bounds every prefix sum.
+template<std::size_t N>
+inline void s3_pointwise_sums(const std::int8_t* input,const std::int8_t* weights,std::uint8_t* raw) {
+  static_assert(N>0 && N%16==0);
+#if defined(__XTENSA__) && defined(CONFIG_IDF_TARGET_ESP32S3)
+  unsigned blocks=N/16;
+  __asm__ volatile(
+    "ee.zero.qacc\\n"
+    "1: ee.vld.128.ip q1, %[x], 16\\n"
+    "ee.vld.128.ip q0, %[w], 16\\n"
+    "ee.vsmulas.s8.qacc.ld.incp q0, %[w], q0, q1, 0\\n"
+    "ee.vsmulas.s8.qacc.ld.incp q0, %[w], q0, q1, 1\\n"
+    "ee.vsmulas.s8.qacc.ld.incp q0, %[w], q0, q1, 2\\n"
+    "ee.vsmulas.s8.qacc.ld.incp q0, %[w], q0, q1, 3\\n"
+    "ee.vsmulas.s8.qacc.ld.incp q0, %[w], q0, q1, 4\\n"
+    "ee.vsmulas.s8.qacc.ld.incp q0, %[w], q0, q1, 5\\n"
+    "ee.vsmulas.s8.qacc.ld.incp q0, %[w], q0, q1, 6\\n"
+    "ee.vsmulas.s8.qacc.ld.incp q0, %[w], q0, q1, 7\\n"
+    "ee.vsmulas.s8.qacc.ld.incp q0, %[w], q0, q1, 8\\n"
+    "ee.vsmulas.s8.qacc.ld.incp q0, %[w], q0, q1, 9\\n"
+    "ee.vsmulas.s8.qacc.ld.incp q0, %[w], q0, q1, 10\\n"
+    "ee.vsmulas.s8.qacc.ld.incp q0, %[w], q0, q1, 11\\n"
+    "ee.vsmulas.s8.qacc.ld.incp q0, %[w], q0, q1, 12\\n"
+    "ee.vsmulas.s8.qacc.ld.incp q0, %[w], q0, q1, 13\\n"
+    "ee.vsmulas.s8.qacc.ld.incp q0, %[w], q0, q1, 14\\n"
+    "ee.vsmulas.s8.qacc q0, q1, 15\\n"
+    "addi %[n], %[n], -1\\n"
+    "bnez %[n], 1b\\n"
+    "ee.st.qacc_l.l.128.ip %[s], 16\\n"
+    "ee.st.qacc_l.h.32.ip %[s], 16\\n"
+    "ee.st.qacc_h.l.128.ip %[s], 16\\n"
+    "ee.st.qacc_h.h.32.ip %[s], 0\\n"
+    : [x] "+&r"(input), [w] "+&r"(weights), [n] "+&r"(blocks), [s] "+&r"(raw)
+    : : "memory");
+#else
+  for(unsigned c=0;c<16;c+=2){
+    std::int32_t a=0,b=0;
+    for(std::size_t i=0;i<N;++i){a+=int(input[i])*weights[i*16+c];b+=int(input[i])*weights[i*16+c+1];}
+    const auto u=static_cast<std::uint32_t>(a)&0xfffffu,v=static_cast<std::uint32_t>(b)&0xfffffu;
+    auto* p=raw+(c/8)*32+((c%8)/2)*5;
+    p[0]=u;p[1]=u>>8;p[2]=(u>>16)|(v<<4);p[3]=v>>4;p[4]=v>>12;
+  }
+#endif
+}
+template<std::size_t IH,std::size_t IW,std::size_t IC,std::size_t OC,std::size_t OH,std::size_t OW,bool RightShiftOnly=false,
+         typename Input,std::size_t W,typename Output>
+NN2PROG_ESP32_IRAM void esp32s3_conv_1x1_qacc(const Input& in,const std::array<std::int8_t,W>& weights,
+           const std::array<std::int32_t,OC>& bias,Output& out,
+           int sh,int sw,int oz,const std::array<std::int32_t,OC>& mult,
+           const std::array<int,OC>& shift,int amin,int amax) {
+  constexpr std::size_t Padded=(IC+15)/16*16;
+  static_assert(OC%16==0 && W==OC*Padded);
+  alignas(16) std::array<std::int8_t,Padded> input{};
+  alignas(16) std::array<std::uint8_t,64> raw;
+  for(std::size_t oy=0;oy<OH;++oy)for(std::size_t ox=0;ox<OW;++ox){
+    std::copy_n(in.data()+(oy*sh*IW+ox*sw)*IC,IC,input.data());
+    for(std::size_t oc=0;oc<OC;oc+=16){
+      s3_pointwise_sums<Padded>(input.data(),weights.data()+oc*Padded,raw.data());
+      s3_output16<RightShiftOnly>(raw.data(),bias.data()+oc,mult.data()+oc,shift.data()+oc,
+          out.data()+(oy*OW+ox)*OC+oc,oz,amin,amax,std::make_index_sequence<16>{});
+    }
+  }
+}
+template<std::size_t IH,std::size_t IW,std::size_t C,std::size_t OH,std::size_t OW,bool RightShiftOnly=false,
+         typename Input,typename Output>
+NN2PROG_ESP32_IRAM void esp32s3_depthwise_3x3(const Input& in,const std::array<std::int8_t,9*C>& weights,
+           const std::array<std::int32_t,C>& bias,Output& out,int sh,int sw,int ph,int pw,int iz,int oz,
+           const std::array<std::int32_t,C>& mult,const std::array<int,C>& shift,int amin,int amax) {
+  static_assert(C%16==0);
+  alignas(16) std::array<std::int8_t,9*C> window;
+  alignas(16) std::array<std::uint8_t,64> raw;
+  for(std::size_t oy=0;oy<OH;++oy)for(std::size_t ox=0;ox<OW;++ox){
+    for(int fy=0;fy<3;++fy)for(int fx=0;fx<3;++fx){
+      const int iy=static_cast<int>(oy)*sh+fy-ph,ix=static_cast<int>(ox)*sw+fx-pw;
+      auto* pixel=window.data()+(fy*3+fx)*C;
+      if(iy>=0 && ix>=0 && iy<static_cast<int>(IH) && ix<static_cast<int>(IW))
+        std::copy_n(in.data()+(iy*IW+ix)*C,C,pixel);
+      else std::fill_n(pixel,C,static_cast<std::int8_t>(iz));
+    }
+    for(std::size_t c=0;c<C;c+=16){
+      s3_depthwise_sums<C>(window.data()+c,weights.data()+c,raw.data());
+      s3_output16<RightShiftOnly>(raw.data(),bias.data()+c,mult.data()+c,shift.data()+c,
+          out.data()+(oy*OW+ox)*C+c,oz,amin,amax,std::make_index_sequence<16>{});
+    }
+  }
+}
 template<std::size_t IH,std::size_t IW,std::size_t IC,std::size_t FH,std::size_t FW,std::size_t OC,
+         std::size_t OH,std::size_t OW,bool RightShiftOnly=false,typename Input,std::size_t W,typename Output>
+NN2PROG_ESP32_IRAM void esp32s3_conv_im2col(const Input& in,const std::array<std::int8_t,W>& weights,
+           const std::array<std::int32_t,OC>& adjusted_bias,Output& out,
+           int stride_h,int stride_w,int pad_h,int pad_w,int input_zero,int output_zero,
+           const std::array<std::int32_t,OC>& mult,const std::array<int,OC>& shift,int amin,int amax) {
+  constexpr std::size_t Padded=(FH*FW*IC+15)/16*16;
+  static_assert(W==OC*Padded);
+  alignas(16) std::array<std::int8_t,Padded> window{};
+  for(std::size_t oy=0;oy<OH;++oy)for(std::size_t ox=0;ox<OW;++ox){
+    const int y=static_cast<int>(oy)*stride_h-pad_h,x=static_cast<int>(ox)*stride_w-pad_w;
+    if(y>=0 && x>=0 && y+static_cast<int>(FH)<=static_cast<int>(IH) && x+static_cast<int>(FW)<=static_cast<int>(IW)){
+      for(std::size_t fy=0;fy<FH;++fy)
+        std::copy_n(in.data()+((y+fy)*IW+x)*IC,FW*IC,window.data()+fy*FW*IC);
+    }else{
+      for(std::size_t fy=0;fy<FH;++fy)for(std::size_t fx=0;fx<FW;++fx){
+        const int iy=y+static_cast<int>(fy),ix=x+static_cast<int>(fx);
+        auto* pixel=window.data()+(fy*FW+fx)*IC;
+        if(iy>=0 && ix>=0 && iy<static_cast<int>(IH) && ix<static_cast<int>(IW))
+          std::copy_n(in.data()+(iy*IW+ix)*IC,IC,pixel);
+        else std::fill_n(pixel,IC,static_cast<std::int8_t>(input_zero));
+      }
+    }
+    for(std::size_t oc=0;oc<OC;++oc){
+      std::int32_t acc=adjusted_bias[oc]+s3_dot16<Padded>(window.data(),weights.data()+oc*Padded);
+      acc=s3_output_scale<RightShiftOnly>(acc,mult[oc],shift[oc])+output_zero;
+      out[(oy*OW+ox)*OC+oc]=static_cast<std::int8_t>(std::clamp<std::int32_t>(acc,amin,amax));
+    }
+  }
+}
+template<std::size_t IH,std::size_t IW,std::size_t IC,std::size_t OC,std::size_t OH,std::size_t OW,bool RightShiftOnly=false,
+         typename Input,std::size_t W,typename Output>
+NN2PROG_ESP32_IRAM void esp32s3_conv_1x1(const Input& in,const std::array<std::int8_t,W>& weights,
+           const std::array<std::int32_t,OC>& adjusted_bias,Output& out,
+           int stride_h,int stride_w,int output_zero,const std::array<std::int32_t,OC>& mult,
+           const std::array<int,OC>& shift,int amin,int amax) {
+  constexpr std::size_t Padded=(IC+15)/16*16;
+  static_assert(W==OC*Padded);
+  alignas(16) std::array<std::int8_t,Padded> aligned_input{};
+  for(std::size_t oy=0;oy<OH;++oy)for(std::size_t ox=0;ox<OW;++ox){
+    std::copy_n(in.data()+(oy*stride_h*IW+ox*stride_w)*IC,IC,aligned_input.data());
+    for(std::size_t oc=0;oc<OC;++oc){
+      std::int32_t acc=adjusted_bias[oc]+s3_dot16<Padded>(aligned_input.data(),weights.data()+oc*Padded);
+      acc=s3_output_scale<RightShiftOnly>(acc,mult[oc],shift[oc])+output_zero;
+      out[(oy*OW+ox)*OC+oc]=static_cast<std::int8_t>(std::clamp<std::int32_t>(acc,amin,amax));
+    }
+  }
+}
+""")
+        c.write("""template<std::size_t IH,std::size_t IW,std::size_t IC,std::size_t FH,std::size_t FW,std::size_t OC,
          std::size_t OH,std::size_t OW,typename Input,std::size_t W,std::size_t B,typename Output>
 void conv2d_nhwc(const Input& in,const std::array<std::uint8_t,W>& weights,const std::array<std::uint8_t,B>& bias,
            Output& out,int stride_h,int stride_w,int dilation_h,int dilation_w,
@@ -480,13 +738,20 @@ void mean_tensor(const Input& in,Output& out,
                 inp,w,b=ins[:3]; o=outs[0]; iq=tensors[inp]["quantization"]; oq=tensors[o]["quantization"]
                 lo=op["lower"]
                 spatial_conv = code == "CONV_2D" and elements(tensors[w]) != elements(tensors[inp]) * tensors[w]["shape"][0]
-                if spatial_conv:
+                if spatial_conv or kernel in ("esp32s3_conv_1x1_dot16", "esp32s3_conv_1x1_qacc16", "esp32s3_conv_im2col_dot16"):
                     ih,iw,ic=nhwc(inp);oh,ow,oc=nhwc(o);_oc,fh,fw,wic=tensors[w]["shape"]
                     if (_oc, wic) != (oc, ic): raise ValueError(f"CONV_2D shape mismatch at op {op['index']}")
                     opts=op["options"];sh=opts["stride_h"];sw=opts["stride_w"];dh=opts["dilation_h"];dw=opts["dilation_w"]
                     ph=padding_before(ih,oh,fh,sh,dh,opts["padding"]);pw=padding_before(iw,ow,fw,sw,dw,opts["padding"])
                     wz=tensors[w]["quantization"]["zero_point"][0]
-                    if kernel == "esp32_conv_1x1_unrolled8_bias_fold":
+                    if kernel == "esp32s3_conv_im2col_dot16":
+                        fast = f"s3_right_shift_only(op{op['index']}_mult,op{op['index']}_shift)"
+                        c.write(f"{indent}esp32s3_conv_im2col<{ih},{iw},{ic},{fh},{fw},{oc},{oh},{ow},{fast}>({ptr(inp)},op{op['index']}_packed,op{op['index']}_esp32_bias,{local(o)},{sh},{sw},{ph},{pw},{iq['zero_point'][0]},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
+                    elif kernel in ("esp32s3_conv_1x1_dot16", "esp32s3_conv_1x1_qacc16"):
+                        fast = f"s3_right_shift_only(op{op['index']}_mult,op{op['index']}_shift)"
+                        fn = "esp32s3_conv_1x1_qacc" if kernel.endswith("qacc16") else "esp32s3_conv_1x1"
+                        c.write(f"{indent}{fn}<{ih},{iw},{ic},{oc},{oh},{ow},{fast}>({ptr(inp)},op{op['index']}_packed,op{op['index']}_esp32_bias,{local(o)},{sh},{sw},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
+                    elif kernel == "esp32_conv_1x1_unrolled8_bias_fold":
                         c.write(f"{indent}esp32_conv_1x1<{ih},{iw},{ic},{oc},{oh},{ow}>({ptr(inp)},{raw(w)},op{op['index']}_esp32_bias,{local(o)},{sh},{sw},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
                     elif kernel == "esp32_conv_nhwc_unrolled8":
                         c.write(f"{indent}esp32_conv_nhwc<{ih},{iw},{ic},{fh},{fw},{oc},{oh},{ow}>({ptr(inp)},{raw(w)},{raw(b)},{local(o)},{sh},{sw},{ph},{pw},{iq['zero_point'][0]},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
@@ -510,7 +775,10 @@ void mean_tensor(const Input& in,Output& out,
                     opts=op["options"];sh=opts["stride_h"];sw=opts["stride_w"];dh=opts["dilation_h"];dw=opts["dilation_w"]
                     ph=padding_before(ih,oh,fh,sh,dh,opts["padding"]);pw=padding_before(iw,ow,fw,sw,dw,opts["padding"])
                     wz=tensors[w]["quantization"]["zero_point"][0]
-                    if kernel == "esp32_depthwise_channels4":
+                    if kernel == "esp32s3_depthwise_3x3_qacc16":
+                        fast = f"s3_right_shift_only(op{op['index']}_mult,op{op['index']}_shift)"
+                        c.write(f"{indent}esp32s3_depthwise_3x3<{ih},{iw},{ic},{oh},{ow},{fast}>({ptr(inp)},op{op['index']}_packed,op{op['index']}_esp32_bias,{local(o)},{sh},{sw},{ph},{pw},{iq['zero_point'][0]},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
+                    elif kernel == "esp32_depthwise_channels4":
                         c.write(f"{indent}esp32_depthwise_channels4<{ih},{iw},{ic},{fh},{fw},{oh},{ow}>({ptr(inp)},{raw(w)},{raw(b)},{local(o)},{sh},{sw},{ph},{pw},{iq['zero_point'][0]},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")
                     else:
                         c.write(f"{indent}depthwise_nhwc<{ih},{iw},{ic},{fh},{fw},{dm},{oh},{ow}>({ptr(inp)},{raw(w)},{raw(b)},{local(o)},{sh},{sw},{dh},{dw},{ph},{pw},{iq['zero_point'][0]},{wz},{oq['zero_point'][0]},op{op['index']}_mult,op{op['index']}_shift,{lo['amin']},{lo['amax']});\n")

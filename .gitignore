@@ -7,3 +7,4 @@ __pycache__/
 sdkconfig
 sdkconfig.old
 /examples/esp32-kws/sdkconfig.esp32
+/examples/esp32-kws/sdkconfig.esp32s3

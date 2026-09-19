@@ -1,3 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
+if(IDF_TARGET STREQUAL "esp32s3")
+  set(SDKCONFIG_DEFAULTS "sdkconfig.s3.defaults")
+endif()
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(nn2prog_mlperf_kws)

@@ -67,12 +67,12 @@ def main():
             model_dir = argument.split("=", 1)[1]
         elif argument.startswith("--target="):
             target = argument.split("=", 1)[1]
-            if target not in ("portable", "x86-avx2", "esp32"):
-                raise SystemExit("--target must be portable, x86-avx2 or esp32")
+            if target not in ("portable", "x86-avx2", "esp32", "esp32s3"):
+                raise SystemExit("--target must be portable, x86-avx2, esp32 or esp32s3")
         else:
             raise SystemExit(f"unknown compiler option: {argument}")
     if model_dir is None:
-        raise SystemExit("usage: compiler.py --model-dir=DIR [--target=portable|x86-avx2|esp32]")
+        raise SystemExit("usage: compiler.py --model-dir=DIR [--target=portable|x86-avx2|esp32|esp32s3]")
     root = pathlib.Path(__file__).resolve().parent.parent
     out = root / model_dir
     if target == "x86-avx2":
@@ -116,12 +116,12 @@ def main():
             globals_.append(f"constexpr std::array<std::int32_t,{channels}> op{op['index']}_mult = {{{','.join(map(str,multipliers))}}};")
             globals_.append(f"constexpr std::array<int,{channels}> op{op['index']}_shift = {{{','.join(map(str,shifts))}}};")
             op["lower"] = {"amin": amin, "amax": amax}
-            if target == "esp32" and op["opcode"] == "CONV_2D":
+            if target in ("esp32", "esp32s3") and op["opcode"] == "CONV_2D":
                 input_shape = tensors[inp]["shape"]
                 output_shape = tensors[output]["shape"]
                 weight_shape = tensors[weights]["shape"]
                 options = op["options"]
-                symmetric_weights = wq["zero_point"][0] == 0
+                symmetric_weights = all(zero == 0 for zero in wq["zero_point"])
                 one_by_one = (len(input_shape) == 4 and len(output_shape) == 4
                               and len(weight_shape) == 4 and weight_shape[1:3] == [1, 1]
                               and weight_shape[3] == input_shape[3]
@@ -131,7 +131,15 @@ def main():
                               or (options["padding"] == "SAME"
                                   and output_shape[1] == (input_shape[1] + options["stride_h"] - 1) // options["stride_h"]
                                   and output_shape[2] == (input_shape[2] + options["stride_w"] - 1) // options["stride_w"]))
-                if one_by_one and no_padding and symmetric_weights:
+                window = math.prod(weight_shape[1:])
+                im2col = (target == "esp32s3" and len(input_shape) == 4
+                          and len(output_shape) == 4 and len(weight_shape) == 4
+                          and weight_shape[3] == input_shape[3]
+                          and weight_shape[0] == output_shape[3]
+                          and options["dilation_h"] == 1 and options["dilation_w"] == 1
+                          and weight_shape[2] * input_shape[3] < 16
+                          and 16 <= window <= 256)
+                if ((one_by_one and no_padding) or im2col) and symmetric_weights:
                     weight_values = [s8(value) for value in const[(0, weights)]]
                     biases = constant_i32(const, _bias)
                     input_zero = iq["zero_point"][0]
@@ -139,7 +147,7 @@ def main():
                     safe = True
                     input_channels = input_shape[3]
                     for channel in range(channels):
-                        channel_weights = weight_values[channel * input_channels:(channel + 1) * input_channels]
+                        channel_weights = weight_values[channel * window:(channel + 1) * window]
                         adjusted = biases[channel] - input_zero * sum(channel_weights)
                         bound = abs(adjusted) + sum(max(abs(-128 * weight), abs(127 * weight))
                                                     for weight in channel_weights)
@@ -150,7 +158,32 @@ def main():
                             f"constexpr std::array<std::int32_t,{channels}> op{op['index']}_esp32_bias = "
                             f"{{{','.join(map(str, adjusted_biases))}}};")
                         kernel_name = "esp32_conv_1x1_unrolled8_bias_fold"
-                        kernel_choices.append(KernelChoice(op["index"], kernel_name))
+                        scratch_bytes = 0
+                        if target == "esp32s3":
+                            padded_channels = (window + 15) // 16 * 16
+                            scratch_bytes = padded_channels
+                            qacc_bound = max(128 * sum(abs(v) for v in weight_values[c*window:(c+1)*window])
+                                             for c in range(channels))
+                            qacc = (one_by_one and no_padding and channels % 16 == 0
+                                    and qacc_bound < 2**19)
+                            packed = []
+                            if qacc:
+                                for base in range(0, channels, 16):
+                                    for i in range(padded_channels):
+                                        packed.extend(weight_values[(base+c)*window+i] if i < window else 0
+                                                      for c in range(16))
+                                scratch_bytes += 64
+                            else:
+                                for channel in range(channels):
+                                    packed.extend(weight_values[channel * window:(channel + 1) * window])
+                                    packed.extend([0] * (padded_channels - window))
+                            globals_.append(
+                                f"alignas(16) constexpr std::array<std::int8_t,{len(packed)}> op{op['index']}_packed = "
+                                f"{{{','.join(map(str, packed))}}};")
+                            kernel_name = "esp32s3_conv_im2col_dot16" if im2col else "esp32s3_conv_1x1_dot16"
+                            if qacc:
+                                kernel_name = "esp32s3_conv_1x1_qacc16"
+                        kernel_choices.append(KernelChoice(op["index"], kernel_name, scratch_bytes))
                         target_kernels.append({
                             "op": op["index"],
                             "opcode": op["opcode"],
@@ -158,7 +191,14 @@ def main():
                             "input_channels": input_channels,
                             "output_channels": channels,
                             "weight_zero_point": 0,
-                            "proof": "int32 interval bound and algebraic input-zero folding",
+                            "proof": ("int32 folded-bias bound and signed20 raw-prefix bound"
+                                      if kernel_name == "esp32s3_conv_1x1_qacc16"
+                                      else "int32 interval bound and algebraic input-zero folding"),
+                            **({"packed_layout": ("output-block16/input-padded16/output-lane" if qacc
+                                                  else "output-channel/filter-window-padded16"),
+                                "raw_dot_abs_bound": qacc_bound,
+                                "packed_weight_bytes": len(packed),
+                                "kernel_scratch_bytes": scratch_bytes} if target == "esp32s3" else {}),
                         })
                 elif (len(input_shape) == 4 and len(output_shape) == 4 and len(weight_shape) == 4
                       and weight_shape[3] == input_shape[3]
@@ -176,7 +216,7 @@ def main():
                         "weight_zero_point": 0,
                         "proof": "loop-order-preserving pointer specialization",
                     })
-            elif target == "esp32" and op["opcode"] == "DEPTHWISE_CONV_2D":
+            elif target in ("esp32", "esp32s3") and op["opcode"] == "DEPTHWISE_CONV_2D":
                 input_shape = tensors[inp]["shape"]
                 output_shape = tensors[output]["shape"]
                 weight_shape = tensors[weights]["shape"]
@@ -189,14 +229,35 @@ def main():
                         and options["dilation_h"] == 1 and options["dilation_w"] == 1
                         and wq["zero_point"][0] == 0):
                     kernel_name = "esp32_depthwise_channels4"
-                    kernel_choices.append(KernelChoice(op["index"], kernel_name))
+                    scratch_bytes = 0
+                    if (target == "esp32s3" and input_shape[3] % 16 == 0
+                            and weight_shape[1:3] == [3, 3]
+                            and all(zero == 0 for zero in wq["zero_point"])):
+                        values = [s8(value) for value in const[(0, weights)]]
+                        biases = constant_i32(const, _bias)
+                        adjusted = []
+                        safe = True
+                        for channel in range(channels):
+                            row = values[channel::channels]
+                            bias = biases[channel] - iq["zero_point"][0] * sum(row)
+                            bound = sum(max(abs(-128*w), abs(127*w)) for w in row)
+                            safe &= bound < 2**19 and abs(bias) + bound < 2**31
+                            adjusted.append(bias)
+                        if safe:
+                            globals_.append(f"alignas(16) constexpr std::array<std::int8_t,{len(values)}> op{op['index']}_packed = {{{','.join(map(str,values))}}};")
+                            globals_.append(f"constexpr std::array<std::int32_t,{channels}> op{op['index']}_esp32_bias = {{{','.join(map(str,adjusted))}}};")
+                            kernel_name = "esp32s3_depthwise_3x3_qacc16"
+                            scratch_bytes = 9*channels+64
+                    kernel_choices.append(KernelChoice(op["index"], kernel_name, scratch_bytes))
                     target_kernels.append({
                         "op": op["index"],
                         "opcode": op["opcode"],
                         "kernel": kernel_name,
                         "channels": input_shape[3],
                         "weight_zero_point": 0,
-                        "proof": "per-channel accumulation order preserved",
+                        "proof": ("signed20 dot bound, int32 folded-bias bound" if scratch_bytes
+                                  else "per-channel accumulation order preserved"),
+                        **({"kernel_scratch_bytes": scratch_bytes} if scratch_bytes else {}),
                     })
         elif op["opcode"] == "MUL":
             a,b=op["inputs"]; o=op["outputs"][0]

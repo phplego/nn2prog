@@ -2,20 +2,22 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-generate_portable() {
+generate() {
   local model_id="$1"
+  local target="${2:-portable}"
   local model="models/$model_id"
-  local output="generated/$model_id/portable"
+  local output="generated/$model_id/$target"
   (cd "$model" && sha256sum --check model.sha256)
   mkdir -p "$output"
   python3 nn2prog/import_tflite.py "$model/model.tflite" \
     "$output/model.ir.json" "$output/model.constants.h"
-  python3 nn2prog/compiler.py --model-dir="$output" --target=portable
+  python3 nn2prog/compiler.py --model-dir="$output" --target="$target"
 }
 
-generate_portable mlperf-kws
-generate_portable hey-jarvis-v1
-generate_portable hey-jarvis-v2
+generate mlperf-kws
+generate hey-jarvis-v1
+generate hey-jarvis-v2
+generate mlperf-kws esp32s3
 mkdir -p build
 cxx="${CXX:-g++}"
 flags=(-std=c++17 -O2 -DNDEBUG)
@@ -47,3 +49,11 @@ cmp examples/hey-jarvis-v1/model.cpp generated/hey-jarvis-v1/portable/model.cpp
 ./build/test-hey-jarvis-v1 tests/hey-jarvis-v1/features.bin tests/hey-jarvis-v1/expected.bin
 ./build/test-hey-jarvis-v2 tests/hey-jarvis-v2/features.bin tests/hey-jarvis-v2/expected.bin
 ./build/test-published-hey-jarvis-v1 tests/hey-jarvis-v1/features.bin tests/hey-jarvis-v1/expected.bin
+
+# Host checks exercise the S3 layout and exact arithmetic, not Xtensa instructions.
+"$cxx" "${flags[@]}" -Igenerated/mlperf-kws/esp32s3 -Itests/mlperf-kws \
+  tests/verify_mlperf.cpp generated/mlperf-kws/esp32s3/model.cpp -o build/test-s3-kws
+./build/test-s3-kws
+"$cxx" "${flags[@]}" -Igenerated/mlperf-kws/esp32s3 \
+  tests/verify_s3.cpp -o build/test-s3-arithmetic
+./build/test-s3-arithmetic

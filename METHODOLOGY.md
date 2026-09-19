@@ -6,7 +6,7 @@ NN2Prog translates a supported quantized TFLite graph into standalone C++17.
 Compilation has two inputs:
 
 - the source `.tflite` model;
-- the target backend: `portable`, `x86-avx2`, or `esp32`.
+- the target backend: `portable`, `x86-avx2`, `esp32`, or `esp32s3`.
 
 Together, the graph, constant tensors, quantization parameters and selected
 target fully determine the generated program.
@@ -54,6 +54,11 @@ The current compiler applies:
 Target kernels are selected from graph shapes, quantization and statically
 checked integer ranges. All generated arithmetic preserves the model result at
 the API boundary used by the corresponding example.
+
+The S3 backend packs constant weights for 128-bit SIMD. QACC kernels are selected
+only when every partial raw sum fits a signed 20-bit lane; bias is added in
+int32 afterwards. Other shapes or ranges retain wider or scalar kernels.
+Output scaling specializes constant shift ranges without changing rounding.
 
 ## Research roadmap: certified decision execution
 

@@ -27,18 +27,22 @@ MLPerf Tiny KWS, identical int8 inputs and top-1 decision semantics:
 | Target | Reference | Reference latency | NN2Prog latency | Speedup | Working memory | Program size |
 |---|---|---:|---:|---:|---:|---:|
 | ESP32-D0WD-V3, 240 MHz | TFLite Micro + ESP-NN | 161.72 ms | **135.37 ms** | **1.195x** | 22,780 → **16,064 B** | flash 287,039 → **187,799 B** |
+| ESP32-S3, 240 MHz | TFLite Micro + ESP-NN | 17.902 ms | **16.420 ms** | **1.090x** | 35,500 → **16,704 B** | flash 322,919 → **206,731 B** |
 | Intel i7-11390H, GCC 13.3 `-O3` | TFLite Micro reference kernels | 7.432 ms | **2.383 ms** | **3.12x** | 24,000 → **16,064 B** | stripped executable 125,840 → **43,136 B** |
 
-The ESP32 result is the primary embedded comparison: 34.6% less flash, 29.5%
+The classic ESP32 result shows 34.6% less flash, 29.5%
 less engine working memory and 1.195x higher model-only throughput than TFLite
 Micro with ESP-NN. The larger x86 speedup is included as a portability result,
 but its baseline uses TFLite Micro's portable reference kernels and should not
 be interpreted as a comparison with an optimized x86 inference engine.
 
-Both comparisons are model-only benchmarks, excluding audio capture and feature
+All comparisons are model-only benchmarks, excluding audio capture and feature
 extraction. NN2Prog produced zero top-1 mismatches against TFLite Micro on 1,024
 deterministic full-range int8 inputs; the ESP32 run additionally passed the same
 golden checksum in all three 64-inference hardware trials.
+The S3 comparison uses ESP-IDF 5.5.3 and six trials across two boots per engine.
+Working memory means tensor-arena use versus generated working buffers, not total
+RAM. For KWS, TFLite Micro computes softmax while NN2Prog returns the same top-1 decision.
 
 The project is intentionally small: Python's standard library is enough to
 generate code, and a normal C++17 compiler is enough to test it.
@@ -94,7 +98,7 @@ python3 nn2prog/compiler.py \
 pio run --project-dir examples/esp32-kws
 ```
 
-The compiler targets are `portable`, `x86-avx2`, and `esp32`. Outputs include:
+The compiler targets are `portable`, `x86-avx2`, `esp32`, and `esp32s3`. Outputs include:
 
 ```text
 model.ir.json
@@ -126,6 +130,9 @@ Install PlatformIO, then run:
 ./build-esp32.sh
 ./flash-esp32.sh /dev/ttyUSB0
 ```
+
+For ESP32-S3, use `./build-esp32.sh esp32s3` and
+`./flash-esp32.sh /dev/ttyACM0 esp32s3`.
 
 PlatformIO downloads the ESP-IDF toolchain on its first build. The firmware
 itself uses only generated C++; it does not download or link a TFLite engine.

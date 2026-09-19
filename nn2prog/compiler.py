@@ -224,13 +224,13 @@ def main():
                 if (len(input_shape) == 4 and len(output_shape) == 4 and len(weight_shape) == 4
                         and weight_shape[0] == 1 and weight_shape[3] == output_shape[3]
                         and output_shape[3] == input_shape[3]
-                        and input_shape[3] % 4 == 0
+                        and (input_shape[3] % 4 == 0 or target == "esp32s3")
                         and options["depth_multiplier"] == 1
                         and options["dilation_h"] == 1 and options["dilation_w"] == 1
                         and wq["zero_point"][0] == 0):
-                    kernel_name = "esp32_depthwise_channels4"
+                    kernel_name = "esp32_depthwise_channels4" if channels % 4 == 0 else "depthwise_nhwc"
                     scratch_bytes = 0
-                    if (target == "esp32s3" and input_shape[3] % 16 == 0
+                    if (target == "esp32s3"
                             and weight_shape[1:3] == [3, 3]
                             and all(zero == 0 for zero in wq["zero_point"])):
                         values = [s8(value) for value in const[(0, weights)]]
@@ -244,10 +244,13 @@ def main():
                             safe &= bound < 2**19 and abs(bias) + bound < 2**31
                             adjusted.append(bias)
                         if safe:
+                            padded = (channels + 15) // 16 * 16
+                            values = [value for tap in range(9)
+                                      for value in values[tap*channels:(tap+1)*channels] + [0]*(padded-channels)]
                             globals_.append(f"alignas(16) constexpr std::array<std::int8_t,{len(values)}> op{op['index']}_packed = {{{','.join(map(str,values))}}};")
                             globals_.append(f"constexpr std::array<std::int32_t,{channels}> op{op['index']}_esp32_bias = {{{','.join(map(str,adjusted))}}};")
                             kernel_name = "esp32s3_depthwise_3x3_qacc16"
-                            scratch_bytes = 9*channels+64
+                            scratch_bytes = 9*padded+64
                     kernel_choices.append(KernelChoice(op["index"], kernel_name, scratch_bytes))
                     target_kernels.append({
                         "op": op["index"],

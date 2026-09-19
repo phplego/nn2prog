@@ -59,6 +59,10 @@ The S3 backend packs constant weights for 128-bit SIMD. QACC kernels are selecte
 only when every partial raw sum fits a signed 20-bit lane; bias is added in
 int32 afterwards. Other shapes or ranges retain wider or scalar kernels.
 Output scaling specializes constant shift ranges without changing rounding.
+Pointwise kernels reuse weight tiles sized for the S3 data cache. Depthwise
+kernels pad partial SIMD groups with zero weights and write only valid lanes.
+The shape tests compare complete kernel outputs with scalar computations,
+including channel tails, padding, stride and multiple weight tiles.
 
 ## Research roadmap: certified decision execution
 

@@ -243,7 +243,7 @@ inline std::uint32_t s3_load_word(const std::uint8_t* p) {
 #if defined(__XTENSA__) && defined(CONFIG_IDF_TARGET_ESP32S3)
   // QACC storage and every requested word offset are four-byte aligned.
   std::uint32_t value;
-  __asm__("l32i %0, %1, 0" : "=r"(value) : "r"(p) : "memory");
+  __builtin_memcpy(&value,__builtin_assume_aligned(p,4),sizeof(value));
   return value;
 #else
   return static_cast<std::uint32_t>(load_i32(p));
@@ -334,37 +334,48 @@ NN2PROG_ESP32_IRAM void esp32s3_conv_1x1_qacc(const Input& in,const std::array<s
            const std::array<int,OC>& shift,int amin,int amax) {
   constexpr std::size_t Padded=(IC+15)/16*16;
   static_assert(OC%16==0 && W==OC*Padded);
+  // Reserve half the 32 KiB data-cache budget for a reusable weight tile.
+  constexpr std::size_t Tile=std::min(OC,std::max(std::size_t{16},(16384/(Padded*16))*16));
   alignas(16) std::array<std::int8_t,Padded> input{};
   alignas(16) std::array<std::uint8_t,64> raw;
-  for(std::size_t oy=0;oy<OH;++oy)for(std::size_t ox=0;ox<OW;++ox){
-    std::copy_n(in.data()+(oy*sh*IW+ox*sw)*IC,IC,input.data());
-    for(std::size_t oc=0;oc<OC;oc+=16){
-      s3_pointwise_sums<Padded>(input.data(),weights.data()+oc*Padded,raw.data());
-      s3_output16<RightShiftOnly>(raw.data(),bias.data()+oc,mult.data()+oc,shift.data()+oc,
-          out.data()+(oy*OW+ox)*OC+oc,oz,amin,amax,std::make_index_sequence<16>{});
+  for(std::size_t base=0;base<OC;base+=Tile){
+    for(std::size_t oy=0;oy<OH;++oy)for(std::size_t ox=0;ox<OW;++ox){
+      std::copy_n(in.data()+(oy*sh*IW+ox*sw)*IC,IC,input.data());
+      for(std::size_t oc=base;oc<std::min(OC,base+Tile);oc+=16){
+        s3_pointwise_sums<Padded>(input.data(),weights.data()+oc*Padded,raw.data());
+        s3_output16<RightShiftOnly>(raw.data(),bias.data()+oc,mult.data()+oc,shift.data()+oc,
+            out.data()+(oy*OW+ox)*OC+oc,oz,amin,amax,std::make_index_sequence<16>{});
+      }
     }
   }
 }
 template<std::size_t IH,std::size_t IW,std::size_t C,std::size_t OH,std::size_t OW,bool RightShiftOnly=false,
          typename Input,typename Output>
-NN2PROG_ESP32_IRAM void esp32s3_depthwise_3x3(const Input& in,const std::array<std::int8_t,9*C>& weights,
+NN2PROG_ESP32_IRAM void esp32s3_depthwise_3x3(const Input& in,const std::array<std::int8_t,9*((C+15)/16*16)>& weights,
            const std::array<std::int32_t,C>& bias,Output& out,int sh,int sw,int ph,int pw,int iz,int oz,
            const std::array<std::int32_t,C>& mult,const std::array<int,C>& shift,int amin,int amax) {
-  static_assert(C%16==0);
-  alignas(16) std::array<std::int8_t,9*C> window;
+  constexpr std::size_t Padded=(C+15)/16*16;
+  alignas(16) std::array<std::int8_t,9*Padded> window;
+  if constexpr(C%16)window.fill(0);
   alignas(16) std::array<std::uint8_t,64> raw;
   for(std::size_t oy=0;oy<OH;++oy)for(std::size_t ox=0;ox<OW;++ox){
     for(int fy=0;fy<3;++fy)for(int fx=0;fx<3;++fx){
       const int iy=static_cast<int>(oy)*sh+fy-ph,ix=static_cast<int>(ox)*sw+fx-pw;
-      auto* pixel=window.data()+(fy*3+fx)*C;
+      auto* pixel=window.data()+(fy*3+fx)*Padded;
       if(iy>=0 && ix>=0 && iy<static_cast<int>(IH) && ix<static_cast<int>(IW))
         std::copy_n(in.data()+(iy*IW+ix)*C,C,pixel);
       else std::fill_n(pixel,C,static_cast<std::int8_t>(iz));
     }
-    for(std::size_t c=0;c<C;c+=16){
-      s3_depthwise_sums<C>(window.data()+c,weights.data()+c,raw.data());
+    for(std::size_t c=0;c+16<=C;c+=16){
+      s3_depthwise_sums<Padded>(window.data()+c,weights.data()+c,raw.data());
       s3_output16<RightShiftOnly>(raw.data(),bias.data()+c,mult.data()+c,shift.data()+c,
           out.data()+(oy*OW+ox)*C+c,oz,amin,amax,std::make_index_sequence<16>{});
+    }
+    if constexpr(C%16){
+      constexpr std::size_t c=C/16*16;
+      s3_depthwise_sums<Padded>(window.data()+c,weights.data()+c,raw.data());
+      s3_output16<RightShiftOnly>(raw.data(),bias.data()+c,mult.data()+c,shift.data()+c,
+          out.data()+(oy*OW+ox)*C+c,oz,amin,amax,std::make_index_sequence<C%16>{});
     }
   }
 }

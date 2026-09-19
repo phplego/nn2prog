@@ -57,3 +57,6 @@ cmp examples/hey-jarvis-v1/model.cpp generated/hey-jarvis-v1/portable/model.cpp
 "$cxx" "${flags[@]}" -Igenerated/mlperf-kws/esp32s3 \
   tests/verify_s3.cpp -o build/test-s3-arithmetic
 ./build/test-s3-arithmetic
+"$cxx" "${flags[@]}" -Igenerated/mlperf-kws/esp32s3 \
+  tests/verify_s3_shapes.cpp -o build/test-s3-shapes
+./build/test-s3-shapes

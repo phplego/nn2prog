@@ -27,7 +27,7 @@ MLPerf Tiny KWS, identical int8 inputs and top-1 decision semantics:
 | Target | Reference | Reference latency | NN2Prog latency | Speedup | Working memory | Program size |
 |---|---|---:|---:|---:|---:|---:|
 | ESP32-D0WD-V3, 240 MHz | TFLite Micro + ESP-NN | 161.72 ms | **135.37 ms** | **1.195x** | 22,780 → **16,064 B** | flash 287,039 → **187,799 B** |
-| ESP32-S3, 240 MHz | TFLite Micro + ESP-NN | 17.902 ms | **16.054 ms** | **1.115x** | 35,500 → **16,704 B** | flash 322,919 → **206,695 B** |
+| ESP32-S3, 240 MHz | TFLite Micro + ESP-NN | 17.902 ms | **15.678 ms** | **1.142x** | 35,500 → **16,704 B** | flash 322,919 → **206,835 B** |
 | Intel i7-11390H, GCC 13.3 `-O3` | TFLite Micro reference kernels | 7.432 ms | **2.383 ms** | **3.12x** | 24,000 → **16,064 B** | stripped executable 125,840 → **43,136 B** |
 
 The classic ESP32 result shows 34.6% less flash, 29.5%

@@ -215,19 +215,21 @@ inline std::int32_t s3_dot16(const std::int8_t* input,const std::int8_t* weights
 template<std::size_t C>
 inline void s3_depthwise_sums(const std::int8_t* input,const std::int8_t* weights,std::uint8_t* raw) {
 #if defined(__XTENSA__) && defined(CONFIG_IDF_TARGET_ESP32S3)
-  unsigned taps=9;
+  // Fuse the first eight MACs with the next input load; never read a tenth tap.
   __asm__ volatile(
     "ee.zero.qacc\\n"
-    "1: ee.vld.128.xp q0, %[x], %[stride]\\n"
+    "ee.vld.128.xp q0, %[x], %[stride]\\n"
+    ".rept 8\\n"
+    "ee.vld.128.xp q1, %[w], %[stride]\\n"
+    "ee.vmulas.s8.qacc.ld.xp q0, %[x], %[stride], q0, q1\\n"
+    ".endr\\n"
     "ee.vld.128.xp q1, %[w], %[stride]\\n"
     "ee.vmulas.s8.qacc q0, q1\\n"
-    "addi %[n], %[n], -1\\n"
-    "bnez %[n], 1b\\n"
     "ee.st.qacc_l.l.128.ip %[s], 16\\n"
     "ee.st.qacc_l.h.32.ip %[s], 16\\n"
     "ee.st.qacc_h.l.128.ip %[s], 16\\n"
     "ee.st.qacc_h.h.32.ip %[s], 0\\n"
-    : [x] "+&r"(input), [w] "+&r"(weights), [n] "+&r"(taps), [s] "+&r"(raw)
+    : [x] "+&r"(input), [w] "+&r"(weights), [s] "+&r"(raw)
     : [stride] "r"(C) : "memory");
 #else
   for(unsigned c=0;c<16;c+=2){
